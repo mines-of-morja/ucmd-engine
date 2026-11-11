@@ -1,0 +1,15 @@
+[package]
+name = "ucmd-providers-classical"
+description = "In-process classical force providers for UnitcellMD: harmonic, Lennard-Jones, OPLS-AA terms, Ewald/PME."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ucmd-core.workspace = true
+ucmd-force.workspace = true
+
+[lints]
+workspace = true

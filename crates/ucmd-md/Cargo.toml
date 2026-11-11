@@ -1,0 +1,15 @@
+[package]
+name = "ucmd-md"
+description = "Dynamics for UnitcellMD: integrators as operator splittings, thermostats, barostats, constraints, run loop."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ucmd-core.workspace = true
+ucmd-force.workspace = true
+
+[lints]
+workspace = true

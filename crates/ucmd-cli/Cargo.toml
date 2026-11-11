@@ -1,0 +1,23 @@
+[package]
+name = "ucmd-cli"
+description = "The ucmd command-line tool: composition root of the UnitcellMD engine."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ucmd-core.workspace = true
+ucmd-force.workspace = true
+ucmd-md.workspace = true
+ucmd-io.workspace = true
+ucmd-providers-classical.workspace = true
+ucmd-providers-ipi.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "ucmd"
+path = "src/main.rs"

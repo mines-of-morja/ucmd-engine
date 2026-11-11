@@ -1,0 +1,13 @@
+[package]
+name = "ucmd-core"
+description = "Core types of the UnitcellMD engine: units, vectors, cell, immutable system, state."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

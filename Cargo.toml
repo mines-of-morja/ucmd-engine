@@ -1,0 +1,29 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+publish = false
+
+# Internal crates. The allowed dependency directions are listed in
+# scripts/check-architecture.sh (PLAN.md §2.7, CLAUDE.md invariant 1).
+[workspace.dependencies]
+ucmd-core = { path = "crates/ucmd-core" }
+ucmd-force = { path = "crates/ucmd-force" }
+ucmd-md = { path = "crates/ucmd-md" }
+ucmd-io = { path = "crates/ucmd-io" }
+ucmd-providers-classical = { path = "crates/ucmd-providers-classical" }
+ucmd-providers-ipi = { path = "crates/ucmd-providers-ipi" }
+
+[workspace.lints.rust]
+missing_docs = "warn" # every public item documents itself, including units
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+# No unwrap/expect in library code; clippy.toml allows them inside tests.
+unwrap_used = "deny"
+expect_used = "deny"
