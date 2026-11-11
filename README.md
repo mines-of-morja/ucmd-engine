@@ -6,7 +6,7 @@ An in-process classical force field, an ML potential or a quantum-chemistry prog
 behind a socket all implement the same `ForceProvider` contract.
 
 **Status:** Phase 0 skeleton. Crate layout and checks only; no physics yet.
-The plan, the shared spec and the agent rules live in the UnitcellMD umbrella repository.
+The plan, the shared spec and the agent rules live in the umbrella repository [UnitcellMD](https://github.com/mines-of-morja/UnitcellMD).
 
 ## Crates
 
@@ -41,4 +41,4 @@ nm, ps, amu, kJ/mol, e and K, everywhere inside the engine and in its files.
 
 ## License
 
-MIT; see [LICENSE](LICENSE).
+Apache-2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
