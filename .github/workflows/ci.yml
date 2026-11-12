@@ -12,7 +12,7 @@ env:
   # against: spec v0.1.0 plus the E2 molecule references (umbrella branch e2). A tag or commit
   # hash, never a moving branch; it moves in the same coordinated update as the references or
   # the spec (PLAN.md §9, spec churn).
-  UMBRELLA_REF: 5253d4fa3cecd13ed1a884d31adf77e33803d740
+  UMBRELLA_REF: da27ef75f62860127d190635d97cdfee3a43078d
 
 jobs:
   rust:

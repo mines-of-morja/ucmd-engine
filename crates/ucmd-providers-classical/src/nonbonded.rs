@@ -8,7 +8,7 @@
 //! - **Coulomb methods:**
 //!   - `direct`: every pair, no cutoff; non-periodic systems.
 //!   - `ewald`: classic Ewald summation, the reference for PME (E2.3).
-//!   - `pme`: smooth PME (E2.4).
+//!   - `pme`: smooth PME (E2.4, [`crate::pme`]).
 //!
 //!   For Ewald and PME the reciprocal part covers every pair, so each excluded and each 1-4 pair
 //!   gets −k_e·qq·erf(αr)/r, and the self energy −k_e·α/√π·Σq² is added. Periodic packages are
@@ -20,6 +20,7 @@
 
 use crate::lj::CutoffMode;
 use crate::neighbor::NeighborList;
+use crate::pme::{Pme, grid_for};
 use crate::topology::PairTopology;
 use serde::Deserialize;
 use std::f64::consts::PI;
@@ -138,6 +139,7 @@ pub struct Nonbonded {
     tail_energy_v: f64,
     tail_virial_v: f64,
     list: NeighborList,
+    pme: Option<Pme>,
 }
 
 impl Nonbonded {
@@ -158,7 +160,13 @@ impl Nonbonded {
             self_energy: 0.0,
             tail_energy_v: 0.0,
             tail_virial_v: 0.0,
+            pme: None,
         }
+    }
+
+    /// The PME grid in use, once the first evaluation has fixed it.
+    pub fn pme_grid(&self) -> Option<[usize; 3]> {
+        self.pme.as_ref().map(Pme::grid)
     }
 
     /// The Coulomb method in use (resolved in `initialize`).
@@ -256,11 +264,6 @@ impl ForceProvider for Nonbonded {
                 "neighbor_skin_nm must be ≥ 0 and 0 < ewald_tolerance < 1".into(),
             ));
         }
-        if self.method == CoulombMethod::Pme {
-            return Err(ForceError::Unsupported(
-                "coulomb = \"pme\" arrives with E2.4; use \"ewald\" for now".into(),
-            ));
-        }
         let ff = system.forcefield.as_ref().ok_or_else(|| {
             ForceError::InvalidInput("nonbonded terms need a parameterized package".into())
         })?;
@@ -352,6 +355,9 @@ impl ForceProvider for Nonbonded {
         self.tail_energy_v = 8.0 * PI / 3.0 * e;
         self.tail_virial_v = 16.0 * PI / 3.0 * w;
         self.list = NeighborList::new(c.cutoff_nm.unwrap_or(0.0), c.neighbor_skin_nm);
+        // The PME grid depends on the cell, so the solver is set up at the first evaluation and
+        // then kept, as OpenMM does.
+        self.pme = None;
         Ok(())
     }
 
@@ -473,12 +479,26 @@ impl ForceProvider for Nonbonded {
             }
             e_coul += self.self_energy;
             let cell = cell.ok_or_else(|| ForceError::Unsupported("Ewald needs a cell".into()))?;
-            let kmax = self
-                .config
-                .ewald_kmax
-                .unwrap_or_else(|| ewald_kmax(cell, alpha, self.config.ewald_tolerance));
-            let (e, w) =
-                ewald_reciprocal(positions, &self.charges, cell, alpha, kmax, &mut out.forces);
+            let (e, w) = if self.method == CoulombMethod::Pme {
+                if self.pme.is_none() {
+                    let grid = self
+                        .config
+                        .pme_grid
+                        .unwrap_or_else(|| grid_for(cell, alpha, self.config.ewald_tolerance));
+                    self.pme = Some(Pme::new(self.config.pme_order, grid)?);
+                }
+                let pme = self
+                    .pme
+                    .as_mut()
+                    .ok_or_else(|| ForceError::Contract("PME solver missing".into()))?;
+                pme.compute(positions, &self.charges, cell, alpha, &mut out.forces)
+            } else {
+                let kmax = self
+                    .config
+                    .ewald_kmax
+                    .unwrap_or_else(|| ewald_kmax(cell, alpha, self.config.ewald_tolerance));
+                ewald_reciprocal(positions, &self.charges, cell, alpha, kmax, &mut out.forces)
+            };
             e_coul += e;
             virial += w;
         }
@@ -665,6 +685,129 @@ mod tests {
                 "{energies:?}"
             );
         }
+    }
+
+    fn coulomb_with(
+        method: CoulombMethod,
+        system: &System,
+        cell: &Cell,
+        positions: &[Vec3],
+        extra: impl Fn(&mut NonbondedConfig),
+    ) -> ForceResult {
+        let mut config = NonbondedConfig {
+            cutoff_nm: Some(0.9),
+            coulomb: Some(method),
+            ..NonbondedConfig::default()
+        };
+        extra(&mut config);
+        let mut p = provider(system, config);
+        let mut out = ForceResult::default();
+        p.evaluate(positions, Some(cell), &EvalRequest::everything(), &mut out)
+            .unwrap();
+        out
+    }
+
+    fn rms_relative(a: &[Vec3], b: &[Vec3]) -> f64 {
+        let n = a.len() as f64;
+        let diff = (a
+            .iter()
+            .zip(b)
+            .map(|(x, y)| (*x - *y).length_squared())
+            .sum::<f64>()
+            / n)
+            .sqrt();
+        let scale = (b.iter().map(|f| f.length_squared()).sum::<f64>() / n).sqrt();
+        diff / scale
+    }
+
+    #[test]
+    fn pme_converges_to_ewald() {
+        // Same α and cutoff in both, so the real-space parts are identical and the comparison
+        // measures the reciprocal part alone. The PME error falls with order and grid spacing.
+        let system = system_of(vec![all_forms_molecule()], &[(0, 6)], [true; 3]);
+        let cell = Cell::new(
+            [[2.9, 0.0, 0.0], [0.3, 2.7, 0.0], [-0.2, 0.4, 2.8]],
+            [true; 3],
+        )
+        .unwrap();
+        let positions = positions_for(&system, 4);
+        let reference = coulomb_with(CoulombMethod::Ewald, &system, &cell, &positions, |c| {
+            c.ewald_alpha_per_nm = Some(3.5);
+            c.ewald_kmax = Some([24, 24, 24]);
+        });
+        let mut previous = f64::INFINITY;
+        for (order, spacing) in [(4, 0.12), (5, 0.08), (6, 0.04)] {
+            let grid =
+                [2.9f64, 2.7, 2.8].map(|l| crate::pme::legal_size((l / spacing).ceil() as usize));
+            let pme = coulomb_with(CoulombMethod::Pme, &system, &cell, &positions, |c| {
+                c.ewald_alpha_per_nm = Some(3.5);
+                c.pme_order = order;
+                c.pme_grid = Some(grid);
+            });
+            let rms = rms_relative(&pme.forces, &reference.forces);
+            let de = (pme.energy.unwrap() - reference.energy.unwrap()).abs()
+                / reference.energy.unwrap().abs();
+            assert!(
+                rms < previous,
+                "order {order}: rms force error {rms:.2e} did not decrease"
+            );
+            previous = rms;
+            if order == 6 {
+                // α·h = 0.14: the expected PME accuracy is ~1e-7 (exactness is tested against
+                // OpenMM with matched parameters in tests/oracle_pme.rs)
+                assert!(
+                    rms < 1e-6 && de < 1e-6,
+                    "order 6: rms {rms:.2e}, energy {de:.2e}"
+                );
+            }
+        }
+        // Default settings (tolerance 1e-5, order 5, OpenMM's grid rule) against Ewald with the
+        // same α: PLAN E2.4 asks for an rms force error ≤ 1e-5.
+        let reference = coulomb_with(CoulombMethod::Ewald, &system, &cell, &positions, |c| {
+            c.ewald_kmax = Some([24, 24, 24]);
+        });
+        let default = coulomb_with(CoulombMethod::Pme, &system, &cell, &positions, |_| {});
+        let rms = rms_relative(&default.forces, &reference.forces);
+        assert!(rms <= 1e-5, "default settings: rms force error {rms:.2e}");
+    }
+
+    #[test]
+    fn pme_passes_the_test_kit() {
+        let system = system_of(vec![all_forms_molecule()], &[(0, 2)], [true; 3]);
+        let cell = Cell::new(
+            [[2.4, 0.0, 0.0], [0.5, 2.3, 0.0], [-0.3, 0.4, 2.2]],
+            [true; 3],
+        )
+        .unwrap();
+        let positions = positions_for(&system, 9);
+        let config = NonbondedConfig {
+            cutoff_nm: Some(0.8),
+            coulomb: Some(CoulombMethod::Pme),
+            pme_grid: Some([24, 24, 24]),
+            ..NonbondedConfig::default()
+        };
+        let mut p = provider(&system, config);
+        let f = fd_force_check(&mut p, &positions, Some(&cell), &FdOptions::default()).unwrap();
+        assert!(f.max_rel_error < 1e-6, "{f:?}");
+        let w = fd_virial_check(&mut p, &positions, Some(&cell), 1e-6).unwrap();
+        assert!(w.max_rel_error < 1e-6, "{w:?}");
+        assert!(determinism_check(&mut p, &positions, Some(&cell)).unwrap());
+        // Smooth PME does not conserve momentum exactly: the net force is of the order of the
+        // interpolation error and vanishes as the grid is refined (Essmann et al. 1995). Runs
+        // remove the centre-of-mass drift ([momentum] in run.toml), as with OpenMM and GROMACS.
+        let coarse = momentum_check(&mut p, &positions, Some(&cell)).unwrap();
+        let mut fine = provider(
+            &system,
+            NonbondedConfig {
+                pme_grid: Some([48, 48, 48]),
+                ..config
+            },
+        );
+        let refined = momentum_check(&mut fine, &positions, Some(&cell)).unwrap();
+        assert!(
+            coarse < 1e-3 && refined < 0.1 * coarse,
+            "net force {coarse:.2e} → {refined:.2e}"
+        );
     }
 
     #[test]

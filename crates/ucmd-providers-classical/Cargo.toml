@@ -12,6 +12,7 @@ ucmd-core.workspace = true
 ucmd-force.workspace = true
 serde.workspace = true
 libm.workspace = true
+rustfft.workspace = true
 
 [lints]
 workspace = true
