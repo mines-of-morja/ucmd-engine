@@ -4,3 +4,8 @@
 //! client (for example an ASE calculator run by `ucmd-bridge`, on this machine or
 //! on another node over TCP) becomes a force provider. Positions and forces travel
 //! in atomic units and are converted at this boundary.
+
+// The provider arrives in E3.1. The dependencies are declared already, so that the crate graph
+// checked by scripts/check-architecture.sh has its final shape.
+use ucmd_core as _;
+use ucmd_force as _;
