@@ -11,7 +11,7 @@ use ucmd_core::Vec3;
 use ucmd_force::{EvalRequest, ForceProvider, ForceResult};
 use ucmd_io::npy::read_vec3_array;
 use ucmd_io::read_package;
-use ucmd_providers_classical::Bonded;
+use ucmd_providers_classical::{Bonded, Nonbonded, NonbondedConfig};
 
 fn references() -> Option<PathBuf> {
     let root = std::env::var_os("UCMD_SPEC_DIR")
@@ -122,5 +122,25 @@ fn bonded_terms_match_openmm() {
             )
             .unwrap();
         check(&case, &out, &["bond", "angle", "dihedral", "improper"]);
+    }
+}
+
+#[test]
+fn nonbonded_terms_match_openmm() {
+    let Some(dir) = references() else { return };
+    for case in cases(&dir) {
+        let package = read_package(&case).unwrap();
+        let mut nonbonded = Nonbonded::new("nonbonded", NonbondedConfig::default());
+        nonbonded.initialize(&package.system).unwrap();
+        let mut out = ForceResult::default();
+        nonbonded
+            .evaluate(
+                &package.state.positions,
+                None,
+                &EvalRequest::everything(),
+                &mut out,
+            )
+            .unwrap();
+        check(&case, &out, &["lj", "lj14", "coulomb"]);
     }
 }

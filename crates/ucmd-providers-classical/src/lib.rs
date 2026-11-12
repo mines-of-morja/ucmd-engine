@@ -5,7 +5,7 @@
 //! - [`neighbor`]: cell list + half Verlet list with skin (E1.8).
 //! - [`topology`]: exclusions and 1-4 pairs from the bond graph (E2.2).
 //! - [`bonded`]: bonds, angles, dihedrals and impropers (E2.1).
-//! - Planned: Coulomb, Ewald and smooth PME (E2.3, E2.4).
+//! - [`nonbonded`]: Lennard-Jones, 1-4 pairs, Coulomb direct and Ewald (E2.2, E2.3); PME next.
 //!
 //! Every provider implements the `ForceProvider` trait from `ucmd-force` and passes the provider
 //! test kit.
@@ -14,6 +14,7 @@ pub mod bonded;
 pub mod harmonic;
 pub mod lj;
 pub mod neighbor;
+pub mod nonbonded;
 pub mod topology;
 
 #[cfg(test)]
@@ -23,4 +24,5 @@ pub use bonded::Bonded;
 pub use harmonic::{HarmonicPairSpring, HarmonicTether, Spring};
 pub use lj::{CutoffMode, LennardJones, LennardJonesConfig};
 pub use neighbor::NeighborList;
+pub use nonbonded::{CoulombMethod, Nonbonded, NonbondedConfig};
 pub use topology::PairTopology;
