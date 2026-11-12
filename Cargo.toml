@@ -32,6 +32,9 @@ rand_distr = "0.6"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 proptest = "1"
+# H5MD trajectories (ADR 0004): bundled static HDF5, no system installation needed
+hdf5 = { package = "hdf5-metno", version = "0.15.1", features = ["static", "zlib"] }
+ndarray = "0.17"
 
 [workspace.lints.rust]
 missing_docs = "warn" # every public item documents itself, including units

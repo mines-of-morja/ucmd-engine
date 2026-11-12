@@ -7,10 +7,15 @@
 //! The step writes into spare buffers and swaps only after a successful force evaluation, so
 //! after a provider error the state of the last completed step is intact (emergency checkpoint).
 
-use crate::kinetics::{degrees_of_freedom, kinetic_energy, remove_com_velocity, temperature};
+use crate::kinetics::{
+    degrees_of_freedom, kinetic_energy, kinetic_tensor, pressure_tensor_bar, remove_com_velocity,
+    temperature,
+};
 use crate::thermostat::Thermostat;
 use ucmd_core::{State, System, Vec3};
-use ucmd_force::{EvalRequest, ForceError, ForceProvider, ForceResult, Guarded};
+use ucmd_force::{
+    EvalRequest, ForceError, ForceProvider, ForceResult, Guarded, Observer, Snapshot,
+};
 
 /// v += F/m·dt (kick, operator B).
 pub fn kick(velocities: &mut [Vec3], forces: &[Vec3], inverse_masses: &[f64], dt_ps: f64) {
@@ -69,6 +74,14 @@ pub enum RunError {
     /// Inconsistent setup.
     #[error("invalid setup: {0}")]
     Setup(String),
+    /// An observer (writer) failed at the given step.
+    #[error("output failed at step {step}: {message}")]
+    Observer {
+        /// Step being written.
+        step: u64,
+        /// What went wrong.
+        message: String,
+    },
 }
 
 /// A running simulation: state, current forces, provider and optional thermostat.
@@ -130,7 +143,12 @@ impl<P: ForceProvider> Dynamics<P> {
             thermostat,
             thermostat_work: 0.0,
         };
-        let request = dynamics.request(dynamics.state.step, true);
+        let request = EvalRequest {
+            step: dynamics.state.step,
+            time_ps: dynamics.state.time_ps,
+            need_energy: true,
+            need_virial: dynamics.provider.capabilities().virial,
+        };
         let state = &dynamics.state;
         dynamics
             .provider
@@ -147,17 +165,15 @@ impl<P: ForceProvider> Dynamics<P> {
         Ok(dynamics)
     }
 
-    fn request(&self, step: u64, initial: bool) -> EvalRequest {
-        EvalRequest {
-            step,
-            time_ps: self.state.time_ps,
-            need_energy: initial || self.config.energy_every_step,
-            need_virial: self.config.virial_every_step && self.provider.capabilities().virial,
-        }
+    /// Advance by one step with the configured energy/virial requests. On error the state is
+    /// unchanged.
+    pub fn step(&mut self) -> Result<(), RunError> {
+        self.step_with(self.config.energy_every_step, self.config.virial_every_step)
     }
 
-    /// Advance by one step. On error the state is unchanged.
-    pub fn step(&mut self) -> Result<(), RunError> {
+    /// Advance by one step, requesting energy and/or virial of the new positions. On error the
+    /// state is unchanged.
+    pub fn step_with(&mut self, need_energy: bool, need_virial: bool) -> Result<(), RunError> {
         let dt = self.config.dt_ps;
         let next_step = self.state.step + 1;
         self.spare_velocities
@@ -179,8 +195,10 @@ impl<P: ForceProvider> Dynamics<P> {
             dt,
         );
         let request = EvalRequest {
+            step: next_step,
             time_ps: self.state.time_ps + dt,
-            ..self.request(next_step, false)
+            need_energy,
+            need_virial: need_virial && self.provider.capabilities().virial,
         };
         self.provider
             .evaluate(
@@ -221,6 +239,82 @@ impl<P: ForceProvider> Dynamics<P> {
             observe(self);
         }
         Ok(())
+    }
+
+    /// Run `steps` steps and let every observer record the steps on its interval; with
+    /// `observe_start`, the current state is recorded first (step 0 of a fresh run).
+    ///
+    /// Energy and virial are requested only for steps that an observer records.
+    pub fn run_observed(
+        &mut self,
+        steps: u64,
+        observers: &mut [Box<dyn Observer>],
+        observe_start: bool,
+    ) -> Result<(), RunError> {
+        let record = |md: &Self, observers: &mut [Box<dyn Observer>]| -> Result<(), RunError> {
+            let step = md.state.step;
+            let snapshot = md.snapshot();
+            for observer in observers
+                .iter_mut()
+                .filter(|o| step % o.every().max(1) == 0)
+            {
+                observer
+                    .observe(&snapshot)
+                    .map_err(|e| RunError::Observer { step, message: e.0 })?;
+            }
+            Ok(())
+        };
+        if observe_start {
+            record(self, observers)?;
+        }
+        for _ in 0..steps {
+            let next = self.state.step + 1;
+            let (mut energy, mut virial) =
+                (self.config.energy_every_step, self.config.virial_every_step);
+            for observer in observers.iter().filter(|o| next % o.every().max(1) == 0) {
+                let (e, w) = observer.needs();
+                energy |= e;
+                virial |= w;
+            }
+            self.step_with(energy, virial)?;
+            record(self, observers)?;
+        }
+        Ok(())
+    }
+
+    /// The current state with forces, energies and kinetic quantities, for observers.
+    pub fn snapshot(&self) -> Snapshot<'_> {
+        let cell = self.state.cell.as_ref();
+        let pressure_bar = match (self.forces.virial, cell) {
+            (Some(w), Some(c)) => Some(pressure_tensor_bar(
+                kinetic_tensor(&self.state.velocities, &self.masses),
+                w,
+                c.volume(),
+            )),
+            _ => None,
+        };
+        Snapshot {
+            step: self.state.step,
+            time_ps: self.state.time_ps,
+            positions: &self.state.positions,
+            velocities: &self.state.velocities,
+            cell,
+            forces: &self.forces,
+            kinetic_energy: self.kinetic_energy(),
+            temperature_k: self.temperature(),
+            conserved_energy: self.conserved_energy(),
+            pressure_bar,
+        }
+    }
+
+    /// The thermostat, e.g. to save its random-generator state in a checkpoint.
+    pub fn thermostat(&self) -> Option<&dyn Thermostat> {
+        self.thermostat.as_deref()
+    }
+
+    /// Restore the accumulated thermostat work after a restart (kJ/mol).
+    pub fn restore_thermostat_work(&mut self, work: f64) {
+        self.thermostat_work = work;
     }
 
     /// The current state.

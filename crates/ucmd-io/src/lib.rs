@@ -6,17 +6,28 @@
 //!   (spec/run-config.md).
 //! - [`npy`]: strict NPY reader and writer for the state arrays.
 //!
-//! Planned: H5MD writer and reader (E1.9), checkpoints (E1.10), extended-XYZ debug writer.
+//! - Writers (observers): [`ThermoWriter`] (TSV), [`XyzWriter`] (extended XYZ, Å, for viewers),
+//!   `H5mdWriter` (feature `h5md`, spec/trajectory-h5md.md).
+//!
+//! Planned: checkpoints (E1.10), H5MD reader for `ucmd rerun`.
 
 pub mod config;
 pub mod elements;
 pub mod error;
+#[cfg(feature = "h5md")]
+pub mod h5md;
 pub mod npy;
 pub mod package;
+pub mod thermo;
+pub mod xyz;
 
 pub use config::{
     FileOutput, Integrator, MachineProfile, MomentumSection, OutputSection, RunConfig,
     ThermostatSection, TrajectoryOutput, VelocitiesSection, load_run_config,
 };
 pub use error::{ErrorCode, SpecError};
+#[cfg(feature = "h5md")]
+pub use h5md::{H5mdOptions, H5mdProvenance, H5mdWriter};
 pub use package::{Package, read_package};
+pub use thermo::ThermoWriter;
+pub use xyz::XyzWriter;
