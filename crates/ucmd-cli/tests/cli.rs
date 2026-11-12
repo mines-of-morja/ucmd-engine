@@ -333,3 +333,56 @@ every = 50
     assert_eq!(package.state.velocities, checkpoint.state.velocities);
     assert!(ucmd().arg("check").arg(&out).status().unwrap().success());
 }
+
+/// `ucmd rerun` on a trajectory reproduces the potential energies the run itself recorded.
+#[test]
+fn rerun_reproduces_the_recorded_energies() {
+    let Some(spec) = spec() else { return };
+    let run_toml = std::fs::read_to_string(spec.join("fixtures/runs/argon-nvt.toml"))
+        .unwrap()
+        .replace(
+            "system = \"../valid/argon-864\"",
+            "system = \"system.ucsys\"",
+        )
+        .replace("steps = 25000", "steps = 200")
+        .replace(
+            "[output.thermo]\nfile = \"thermo.tsv\"\nevery = 10",
+            "[output.thermo]\nfile = \"thermo.tsv\"\nevery = 50",
+        )
+        .replace(
+            "[output.trajectory]\nfile = \"trajectory.h5\"\nevery = 100",
+            "[output.trajectory]\nfile = \"trajectory.h5\"\nevery = 50",
+        );
+    let dir = run_dir("rerun", &spec, "argon-864", &run_toml);
+    assert!(
+        ucmd()
+            .arg("run")
+            .arg(dir.join("run.toml"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    let out = dir.join("rerun.tsv");
+    let status = ucmd()
+        .arg("rerun")
+        .arg(dir.join("run.toml"))
+        .arg("--trajectory")
+        .arg(dir.join("out/trajectory.h5"))
+        .arg("--out")
+        .arg(&out)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let column = |path: &Path, index: usize| -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .map(|l| l.split('\t').nth(index).unwrap().to_string())
+            .collect()
+    };
+    let recorded = column(&dir.join("out/thermo.tsv"), 2);
+    let reevaluated = column(&out, 2);
+    assert_eq!(recorded.len(), 5);
+    assert_eq!(recorded, reevaluated);
+}

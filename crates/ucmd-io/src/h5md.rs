@@ -564,3 +564,100 @@ impl Observer for H5mdWriter {
         self.file.flush().map_err(err("flush"))
     }
 }
+
+/// One frame of an H5MD trajectory.
+#[derive(Debug, Clone, PartialEq)]
+pub struct H5mdFrame {
+    /// MD step.
+    pub step: u64,
+    /// Time in ps.
+    pub time_ps: f64,
+    /// Positions in nm (as stored: unwrapped for ucmd trajectories).
+    pub positions: Vec<ucmd_core::Vec3>,
+    /// Cell rows in nm (zeros for non-periodic systems).
+    pub cell_rows: [[f64; 3]; 3],
+}
+
+/// Frame-by-frame reader of the position and box elements of an H5MD file (spec profile).
+pub struct H5mdReader {
+    steps: Vec<i64>,
+    times: Vec<f64>,
+    value: Dataset,
+    edges: Dataset,
+    n_atoms: usize,
+}
+
+impl H5mdReader {
+    /// Open `path` for reading.
+    pub fn open(path: &Path) -> Result<Self, ObserverError> {
+        let file = File::open(path).map_err(err("open"))?;
+        let position = file
+            .group("particles/all/position")
+            .map_err(err("position"))?;
+        let steps: Vec<i64> = position
+            .dataset("step")
+            .and_then(|d| d.read_raw())
+            .map_err(err("step"))?;
+        let times: Vec<f64> = position
+            .dataset("time")
+            .and_then(|d| d.read_raw())
+            .map_err(err("time"))?;
+        let value = position.dataset("value").map_err(err("value"))?;
+        let edges = file
+            .dataset("particles/all/box/edges/value")
+            .map_err(err("box/edges"))?;
+        let shape = value.shape();
+        if shape.len() != 3 || shape[0] != steps.len() || shape[2] != 3 {
+            return Err(ObserverError(format!(
+                "H5MD {}: unexpected position shape {shape:?}",
+                path.display()
+            )));
+        }
+        Ok(Self {
+            steps,
+            times,
+            value,
+            edges,
+            n_atoms: shape[1],
+        })
+    }
+
+    /// Number of frames.
+    pub fn len(&self) -> usize {
+        self.steps.len()
+    }
+
+    /// True without frames.
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    /// Number of atoms.
+    pub fn n_atoms(&self) -> usize {
+        self.n_atoms
+    }
+
+    /// Frame `k` (positions converted to f64 if stored as float32).
+    pub fn frame(&self, k: usize) -> Result<H5mdFrame, ObserverError> {
+        let raw: ndarray::Array2<f64> = self
+            .value
+            .read_slice_2d(s![k, .., ..])
+            .map_err(err("read position"))?;
+        let positions = raw
+            .rows()
+            .into_iter()
+            .map(|r| ucmd_core::Vec3::new(r[0], r[1], r[2]))
+            .collect();
+        let box_raw: ndarray::Array2<f64> = self
+            .edges
+            .read_slice_2d(s![k, .., ..])
+            .map_err(err("read box"))?;
+        let cell_rows = std::array::from_fn(|a| std::array::from_fn(|b| box_raw[[a, b]]));
+        Ok(H5mdFrame {
+            step: u64::try_from(self.steps[k]).unwrap_or(0),
+            time_ps: self.times[k],
+            positions,
+            cell_rows,
+        })
+    }
+}

@@ -63,6 +63,18 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Evaluate the providers on every frame of an H5MD trajectory; writes a TSV with step, time,
+    /// potential energy, virial pressure and energy terms.
+    Rerun {
+        /// The run configuration (package and providers).
+        run_toml: PathBuf,
+        /// H5MD trajectory to evaluate.
+        #[arg(long)]
+        trajectory: PathBuf,
+        /// Output table (TSV).
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Evaluate the providers once on the initial state and print energies as JSON.
     Singlepoint {
         /// The run configuration.
@@ -88,6 +100,11 @@ fn main() -> ExitCode {
             checkpoint,
             out,
         } => export(&run_toml, &checkpoint, &out),
+        Command::Rerun {
+            run_toml,
+            trajectory,
+            out,
+        } => rerun(&run_toml, &trajectory, &out),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -489,4 +506,92 @@ fn export(run_toml: &Path, checkpoint: &Path, out: &Path) -> Result<()> {
     read_package(out).map_err(|e| anyhow!("the exported package is invalid: {e}"))?;
     eprintln!("exported step {} to {}", c.meta.step, out.display());
     Ok(())
+}
+
+#[cfg(feature = "h5md")]
+fn rerun(run_toml: &Path, trajectory: &Path, out: &Path) -> Result<()> {
+    use std::io::Write;
+    let s = setup(run_toml)?;
+    let system = &s.package.system;
+    let reader = ucmd_io::H5mdReader::open(trajectory).map_err(|e| anyhow!("{e}"))?;
+    if reader.n_atoms() != system.n_atoms() {
+        bail!(
+            "{} has {} atoms, the package {}",
+            trajectory.display(),
+            reader.n_atoms(),
+            system.n_atoms()
+        );
+    }
+    let mut provider = Guarded::new(registry::make_providers(&s.config, &s.package.state)?);
+    provider.initialize(system).map_err(|e| anyhow!("{e}"))?;
+    let need_virial = provider.capabilities().virial;
+    let mut table = std::io::BufWriter::new(std::fs::File::create(out)?);
+    let mut result = ForceResult::default();
+    let mut terms: Option<Vec<String>> = None;
+    for k in 0..reader.len() {
+        let frame = reader.frame(k).map_err(|e| anyhow!("{e}"))?;
+        let cell = if system.is_periodic() {
+            Some(
+                ucmd_core::Cell::new(frame.cell_rows, system.periodicity)
+                    .map_err(|e| anyhow!("frame {k}: {e}"))?,
+            )
+        } else {
+            None
+        };
+        let request = EvalRequest {
+            step: frame.step,
+            time_ps: frame.time_ps,
+            need_energy: true,
+            need_virial,
+        };
+        provider
+            .evaluate(&frame.positions, cell.as_ref(), &request, &mut result)
+            .map_err(|e| anyhow!("frame {k} (step {}): {e}", frame.step))?;
+        if terms.is_none() {
+            let names: Vec<String> = result.energy_terms.iter().map(|(n, _)| n.clone()).collect();
+            let mut header = String::from("# step\ttime_ps\tpotential_kjmol\tvirial_pressure_bar");
+            for name in &names {
+                header.push_str(&format!("\tterm:{name}_kjmol"));
+            }
+            writeln!(table, "{header}")?;
+            terms = Some(names);
+        }
+        let pressure = match (result.virial, cell.as_ref()) {
+            (Some(w), Some(c)) => {
+                (w.col(0)[0] + w.col(1)[1] + w.col(2)[2]) / (3.0 * c.volume()) * BAR_PER_KJMOL_NM3
+            }
+            _ => f64::NAN,
+        };
+        let mut line = format!(
+            "{}\t{:.6}\t{:.10e}\t{:.10e}",
+            frame.step,
+            frame.time_ps,
+            result.energy.unwrap_or(f64::NAN),
+            pressure
+        );
+        for name in terms.iter().flatten() {
+            let value = result
+                .energy_terms
+                .iter()
+                .find(|(n, _)| n == name)
+                .map_or(f64::NAN, |(_, v)| *v);
+            line.push_str(&format!("\t{value:.10e}"));
+        }
+        writeln!(table, "{line}")?;
+    }
+    table.flush()?;
+    eprintln!(
+        "rerun: {} frames evaluated, table written to {}",
+        reader.len(),
+        out.display()
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "h5md"))]
+fn rerun(_: &Path, trajectory: &Path, _: &Path) -> Result<()> {
+    bail!(
+        "{}: rerun needs H5MD support (feature \"h5md\")",
+        trajectory.display()
+    )
 }

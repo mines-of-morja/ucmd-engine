@@ -31,7 +31,7 @@ pub use config::{
 };
 pub use error::{ErrorCode, SpecError};
 #[cfg(feature = "h5md")]
-pub use h5md::{H5mdOptions, H5mdProvenance, H5mdWriter};
+pub use h5md::{H5mdFrame, H5mdOptions, H5mdProvenance, H5mdReader, H5mdWriter};
 pub use package::{Package, read_package};
 pub use thermo::ThermoWriter;
 pub use xyz::XyzWriter;
