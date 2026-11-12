@@ -9,6 +9,11 @@ publish.workspace = true
 
 [dependencies]
 ucmd-core.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+# Generic provider checks (spec/force-provider.md §6) for tests of every provider crate.
+testkit = []

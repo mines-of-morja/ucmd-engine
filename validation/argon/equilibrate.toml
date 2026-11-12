@@ -1,0 +1,35 @@
+spec_version = "0.1.0"
+system = "out/argon-864.ucsys"
+title = "E1.12 argon: CSVR equilibration at the Rahman 1964 state point"
+
+[run]
+integrator = "velocity-verlet"
+timestep_fs = 4.0
+steps = 5000
+seed = 1964
+
+[velocities]
+generate = "maxwell-boltzmann"
+temperature_K = 94.4
+
+[thermostat]
+kind = "csvr"
+temperature_K = 94.4
+tau_ps = 0.5
+
+[[providers]]
+kind = "lennard-jones"
+cutoff_nm = 0.85
+cutoff_mode = "potential-shift"
+dispersion_correction = false
+
+[output]
+directory = "out/equilibrate"
+
+[output.thermo]
+file = "thermo.tsv"
+every = 50
+
+[output.checkpoint]
+file = "checkpoint.ucchk"
+every = 5000

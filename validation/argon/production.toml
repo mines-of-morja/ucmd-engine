@@ -1,0 +1,26 @@
+spec_version = "0.1.0"
+system = "out/equilibrated.ucsys"
+title = "E1.12 argon: NVE production, 100 ps"
+
+[run]
+integrator = "velocity-verlet"
+timestep_fs = 4.0
+steps = 25000
+seed = 1
+
+[[providers]]
+kind = "lennard-jones"
+cutoff_nm = 0.85
+cutoff_mode = "potential-shift"
+dispersion_correction = false
+
+[output]
+directory = "out/production"
+
+[output.thermo]
+file = "thermo.tsv"
+every = 10
+
+[output.trajectory]
+file = "trajectory.h5"
+every = 100

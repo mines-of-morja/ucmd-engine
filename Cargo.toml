@@ -19,6 +19,23 @@ ucmd-io = { path = "crates/ucmd-io" }
 ucmd-providers-classical = { path = "crates/ucmd-providers-classical" }
 ucmd-providers-ipi = { path = "crates/ucmd-providers-ipi" }
 
+# External crates (versions checked 2026-11-12, docs/design/E1.md §1)
+glam = "0.34"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+sha2 = "0.11"
+rand = "0.10"
+rand_chacha = { version = "0.10", features = ["serde"] }
+rand_distr = "0.6"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+proptest = "1"
+# H5MD trajectories (ADR 0004): bundled static HDF5, no system installation needed
+hdf5 = { package = "hdf5-metno", version = "0.15.1", features = ["static", "zlib"] }
+ndarray = "0.17"
+
 [workspace.lints.rust]
 missing_docs = "warn" # every public item documents itself, including units
 unsafe_code = "deny"

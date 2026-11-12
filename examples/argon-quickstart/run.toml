@@ -1,0 +1,43 @@
+# Quickstart: 864 argon atoms (Rahman 1964 state point), 20 ps NVT with the CSVR thermostat.
+# Needs the UnitcellMD workspace layout: the spec fixtures one level above ucmd-engine.
+# Run from anywhere:   ucmd run examples/argon-quickstart/run.toml
+# Outputs go to examples/argon-quickstart/out/ (paths are relative to this file).
+spec_version = "0.1.0"
+system = "../../../spec/fixtures/valid/argon-864"
+title = "Quickstart: argon NVT, 20 ps"
+
+[run]
+integrator = "velocity-verlet"
+timestep_fs = 4.0
+steps = 5000
+seed = 42
+
+[velocities]
+generate = "maxwell-boltzmann"
+temperature_K = 94.4
+
+[thermostat]
+kind = "csvr"
+temperature_K = 94.4
+tau_ps = 0.5
+
+[[providers]]
+kind = "lennard-jones"
+cutoff_nm = 0.85
+cutoff_mode = "potential-shift"
+dispersion_correction = true
+
+[output]
+directory = "out"
+
+[output.thermo]
+file = "thermo.tsv"
+every = 50
+
+[output.trajectory]
+file = "trajectory.xyz"      # extended XYZ in Å for any viewer; use a .h5 name for H5MD
+every = 50
+
+[output.checkpoint]
+file = "checkpoint.ucchk"
+every = 2500

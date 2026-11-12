@@ -9,6 +9,22 @@ publish.workspace = true
 
 [dependencies]
 ucmd-core.workspace = true
+ucmd-force.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+sha2.workspace = true
+hdf5 = { workspace = true, optional = true }
+ndarray = { workspace = true, optional = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[features]
+# H5MD trajectory writer (ADR 0004). Without it only the extended-XYZ trajectory is available.
+default = ["h5md"]
+h5md = ["dep:hdf5", "dep:ndarray"]
