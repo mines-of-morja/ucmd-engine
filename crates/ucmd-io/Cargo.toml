@@ -9,6 +9,15 @@ publish.workspace = true
 
 [dependencies]
 ucmd-core.workspace = true
+ucmd-force.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+sha2.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
