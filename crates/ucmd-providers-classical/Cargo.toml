@@ -13,3 +13,6 @@ ucmd-force.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+ucmd-force = { workspace = true, features = ["testkit"] }

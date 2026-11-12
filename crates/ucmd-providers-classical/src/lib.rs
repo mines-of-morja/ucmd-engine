@@ -1,6 +1,12 @@
 //! In-process classical force providers.
 //!
-//! Planned contents (tasks E1.3, E1.7, E1.8, E2.1–E2.4): harmonic test providers,
-//! Lennard-Jones, bonded OPLS-AA terms, Coulomb, Ewald and smooth PME, and
-//! neighbour lists. Every provider implements the `ForceProvider` trait from
-//! `ucmd-force` and passes the provider test kit.
+//! - [`harmonic`]: analytic tether and pair-spring providers (E1.3).
+//! - Planned: Lennard-Jones (E1.7), neighbour lists (E1.8), bonded OPLS-AA terms, Coulomb,
+//!   Ewald and smooth PME (E2).
+//!
+//! Every provider implements the `ForceProvider` trait from `ucmd-force` and passes the provider
+//! test kit.
+
+pub mod harmonic;
+
+pub use harmonic::{HarmonicPairSpring, HarmonicTether, Spring};

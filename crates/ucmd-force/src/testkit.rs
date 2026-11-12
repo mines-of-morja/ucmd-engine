@@ -126,15 +126,19 @@ pub struct VirialReport {
     pub asymmetry: f64,
 }
 
+/// Apply the strain component ε_ab = δ in the row-vector convention of spec/units.md §4:
+/// r_b → r_b + δ·r_a.
 fn strain(m: Vec3, a: usize, b: usize, delta: f64) -> Vec3 {
     let mut out = m;
-    out[a] += delta * m[b];
+    out[b] += delta * m[a];
     out
 }
 
 /// Compare the analytic virial with central differences of the energy under homogeneous strain
-/// r → (1 + δE_ab)·r (and the same for the lattice vectors). Diagonal and upper components are
-/// probed; they keep the cell lower-triangular. The lower ones follow from the symmetry check.
+/// ε_ab = ±δ, applied as r_b → r_b + ε_ab·r_a to positions and lattice vectors (spec/units.md §4).
+/// The diagonal and the lower components are probed; they keep the cell lower-triangular. The
+/// upper ones need a rotated cell and are not probed. `asymmetry` reports |W − Wᵀ|, which is zero
+/// for rotation-invariant potentials.
 pub fn fd_virial_check(
     provider: &mut dyn ForceProvider,
     positions: &[Vec3],
@@ -148,7 +152,7 @@ pub fn fd_virial_check(
         .flat_map(|b| (0..3).map(move |a| w.col(b)[a].abs()))
         .fold(1e-3, f64::max);
     let mut worst = 0.0f64;
-    for (a, b) in [(0, 0), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2)] {
+    for (a, b) in [(0, 0), (1, 1), (2, 2), (1, 0), (2, 0), (2, 1)] {
         let mut energies = [0.0; 2];
         for (slot, sign) in [(0, 1.0), (1, -1.0)] {
             let moved: Vec<Vec3> = positions
