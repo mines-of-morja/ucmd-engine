@@ -79,6 +79,21 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Relax the package's positions with FIRE (E2.0) and write them as a new package, e.g. after
+    /// packing. Uses the package and providers of run.toml; writes nothing unless it converges.
+    Minimize {
+        /// The run configuration (package and providers).
+        run_toml: PathBuf,
+        /// Directory of the new package (created; must not exist).
+        #[arg(long)]
+        out: PathBuf,
+        /// Convergence: largest atomic force in kJ mol⁻¹ nm⁻¹.
+        #[arg(long, default_value_t = 100.0)]
+        max_force: f64,
+        /// Give up after this many steps.
+        #[arg(long, default_value_t = 10_000)]
+        max_steps: u64,
+    },
     /// Evaluate the providers once on the initial state and print energies as JSON.
     Singlepoint {
         /// The run configuration.
@@ -99,6 +114,12 @@ fn main() -> ExitCode {
             force,
         } => run(&run_toml, restart.as_deref(), force),
         Command::Singlepoint { run_toml, forces } => singlepoint(&run_toml, forces.as_deref()),
+        Command::Minimize {
+            run_toml,
+            out,
+            max_force,
+            max_steps,
+        } => minimize(&run_toml, &out, max_force, max_steps),
         Command::Export {
             run_toml,
             checkpoint,
@@ -220,6 +241,89 @@ fn singlepoint(run_toml: &Path, forces_out: Option<&Path>) -> Result<()> {
 }
 
 /// Initial velocities and momentum handling of spec/run-config.md (`[velocities]`, `[momentum]`).
+fn minimize(run_toml: &Path, out: &Path, max_force: f64, max_steps: u64) -> Result<()> {
+    if out.exists() {
+        bail!("{} exists; choose a new directory", out.display());
+    }
+    let s = setup(run_toml)?;
+    let state = &s.package.state;
+    let mut provider = Guarded::new(registry::make_providers(&s.config, state)?);
+    provider
+        .initialize(&s.package.system)
+        .map_err(|e| anyhow!("{e}"))?;
+    let config = ucmd_md::minimize::FireConfig {
+        max_force_kjmol_nm: max_force,
+        max_steps,
+        ..ucmd_md::minimize::FireConfig::default()
+    };
+    let mut positions = state.positions.clone();
+    eprintln!(
+        "ucmd {VERSION} ({GIT_HASH}) minimize: {} atoms, FIRE until max |F| < {max_force} kJ/mol/nm\n  hardware: {}",
+        s.package.system.n_atoms(),
+        hardware::describe(1)
+    );
+    let started = Instant::now();
+    let report = ucmd_md::minimize::minimize(
+        &mut provider,
+        s.package.system.masses(),
+        &mut positions,
+        state.cell.as_ref(),
+        &config,
+        |step, energy, force| {
+            if step % 100 == 0 {
+                eprintln!(
+                    "  step {step:>6}  E = {energy:.4} kJ/mol  max |F| = {force:.2} kJ/mol/nm"
+                );
+            }
+        },
+    )
+    .map_err(|e| anyhow!("minimization failed: {e}"))?;
+    eprintln!(
+        "{}: {} steps in {:.1} s, E {:.4} → {:.4} kJ/mol, max |F| {:.1} → {:.2} kJ/mol/nm",
+        report.reason,
+        report.steps,
+        started.elapsed().as_secs_f64(),
+        report.energy_start_kjmol,
+        report.energy_kjmol,
+        report.max_force_start_kjmol_nm,
+        report.max_force_kjmol_nm
+    );
+    if !report.converged {
+        bail!(
+            "not converged ({}); nothing written. Raise --max-steps or --max-force, or check the system",
+            report.reason
+        );
+    }
+    let mut doc: serde_json::Value = serde_json::from_str(&s.system_json)?;
+    let original = doc["provenance"].take();
+    doc["provenance"] = serde_json::json!({
+        "created_by": format!("ucmd {VERSION} ({GIT_HASH}) minimize"),
+        "created_utc": utc_now(),
+        "notes": format!("FIRE 2.0 minimization of the package of {}", run_toml.display()),
+        "minimization": {
+            "method": "FIRE 2.0 (Guénolé et al. 2020), semi-implicit Euler",
+            "steps": report.steps,
+            "max_force_criterion_kjmol_nm": max_force,
+            "energy_start_kjmol": report.energy_start_kjmol,
+            "energy_kjmol": report.energy_kjmol,
+            "max_force_start_kjmol_nm": report.max_force_start_kjmol_nm,
+            "max_force_kjmol_nm": report.max_force_kjmol_nm,
+            "run_config_toml": s.config.resolved_toml(),
+        },
+        "hardware": hardware::describe(1),
+        "derived_from": original,
+    });
+    std::fs::create_dir_all(out)?;
+    std::fs::write(
+        out.join("system.json"),
+        serde_json::to_string_pretty(&doc)? + "\n",
+    )?;
+    ucmd_io::npy::write_vec3_array(&out.join("positions.npy"), &positions)?;
+    read_package(out).map_err(|e| anyhow!("the minimized package is invalid: {e}"))?;
+    eprintln!("wrote {}", out.display());
+    Ok(())
+}
+
 fn initial_state(s: &Setup, dof: f64) -> State {
     let mut state = s.package.state.clone();
     let masses = s.package.system.masses();

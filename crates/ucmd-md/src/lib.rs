@@ -13,6 +13,7 @@
 
 pub mod dynamics;
 pub mod kinetics;
+pub mod minimize;
 pub mod random;
 pub mod thermostat;
 pub mod velocities;
