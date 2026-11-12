@@ -280,3 +280,56 @@ fn restart_is_bitwise_identical() {
         );
     }
 }
+
+/// `ucmd export` turns a checkpoint into a valid package that carries the checkpoint's state.
+#[test]
+fn export_writes_a_valid_package_with_velocities() {
+    let Some(spec) = spec() else { return };
+    let dir = run_dir(
+        "export",
+        &spec,
+        "harmonic-3d",
+        r#"spec_version = "0.1.0"
+system = "system.ucsys"
+
+[run]
+integrator = "velocity-verlet"
+timestep_fs = 1.0
+steps = 50
+seed = 1
+
+[[providers]]
+kind = "harmonic-tether"
+k_kjmol_nm2 = 1000.0
+
+[output.checkpoint]
+file = "checkpoint.ucchk"
+every = 50
+"#,
+    );
+    assert!(
+        ucmd()
+            .arg("run")
+            .arg(dir.join("run.toml"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    let out = dir.join("exported.ucsys");
+    let status = ucmd()
+        .arg("export")
+        .arg(dir.join("run.toml"))
+        .arg("--checkpoint")
+        .arg(dir.join("out/checkpoint.ucchk"))
+        .arg("--out")
+        .arg(&out)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let package = ucmd_io::read_package(&out).unwrap();
+    let checkpoint = ucmd_io::Checkpoint::read(&dir.join("out/checkpoint.ucchk")).unwrap();
+    assert!(package.has_velocities);
+    assert_eq!(package.state.positions, checkpoint.state.positions);
+    assert_eq!(package.state.velocities, checkpoint.state.velocities);
+    assert!(ucmd().arg("check").arg(&out).status().unwrap().success());
+}

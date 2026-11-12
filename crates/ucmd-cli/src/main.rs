@@ -51,6 +51,18 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Turn a checkpoint into a new system package (positions, velocities, current cell), e.g. to
+    /// continue an equilibrated state with a different protocol.
+    Export {
+        /// The run configuration whose package the checkpoint belongs to.
+        run_toml: PathBuf,
+        /// The checkpoint.
+        #[arg(long)]
+        checkpoint: PathBuf,
+        /// Directory of the new package (created; must not exist).
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Evaluate the providers once on the initial state and print energies as JSON.
     Singlepoint {
         /// The run configuration.
@@ -71,6 +83,11 @@ fn main() -> ExitCode {
             force,
         } => run(&run_toml, restart.as_deref(), force),
         Command::Singlepoint { run_toml, forces } => singlepoint(&run_toml, forces.as_deref()),
+        Command::Export {
+            run_toml,
+            checkpoint,
+            out,
+        } => export(&run_toml, &checkpoint, &out),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -412,5 +429,64 @@ fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
         },
         dynamics.temperature()
     );
+    Ok(())
+}
+
+/// Current UTC time as RFC 3339 (seconds), without a date library.
+fn utc_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    // civil-from-days (H. Hinnant)
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+fn export(run_toml: &Path, checkpoint: &Path, out: &Path) -> Result<()> {
+    let s = setup(run_toml)?;
+    let c = ucmd_io::Checkpoint::read(checkpoint).map_err(|e| anyhow!("{e}"))?;
+    if c.meta.system_sha256 != s.package.system.system_sha256 {
+        bail!(
+            "the checkpoint does not belong to the package of {}",
+            run_toml.display()
+        );
+    }
+    if out.exists() {
+        bail!("{} exists; choose a new directory", out.display());
+    }
+    let mut doc: serde_json::Value = serde_json::from_str(&s.system_json)?;
+    if let Some(cell) = &c.state.cell {
+        doc["cell_nm"] = serde_json::json!(cell.rows().map(|v| v.to_array()));
+    }
+    let original = doc["provenance"].take();
+    doc["provenance"] = serde_json::json!({
+        "created_by": format!("ucmd {VERSION} ({GIT_HASH}) export of checkpoint step {}", c.meta.step),
+        "created_utc": utc_now(),
+        "notes": format!("time {} ps of the run {}", c.meta.time_ps, run_toml.display()),
+        "derived_from": original,
+    });
+    std::fs::create_dir_all(out)?;
+    std::fs::write(
+        out.join("system.json"),
+        serde_json::to_string_pretty(&doc)? + "\n",
+    )?;
+    ucmd_io::npy::write_vec3_array(&out.join("positions.npy"), &c.state.positions)?;
+    ucmd_io::npy::write_vec3_array(&out.join("velocities.npy"), &c.state.velocities)?;
+    read_package(out).map_err(|e| anyhow!("the exported package is invalid: {e}"))?;
+    eprintln!("exported step {} to {}", c.meta.step, out.display());
     Ok(())
 }
