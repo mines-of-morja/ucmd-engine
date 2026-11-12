@@ -7,15 +7,29 @@ on:
 permissions:
   contents: read
 
+env:
+  # Umbrella branch or tag whose spec/ fixtures and tools/oracle/ references this branch is tested
+  # against. spec v0.1 lives on `phase-0` until Gate 0 merges it into `main`; then set `main` or a
+  # spec tag here.
+  UMBRELLA_REF: phase-0
+
 jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The umbrella repo has the same owner (organization or personal account). While the repos
+      # are private, the default token cannot read it: add a read-only fine-grained token as the
+      # secret UMBRELLA_TOKEN. Without access the contract and reference tests are skipped, with a
+      # warning on the run; locally they always run (`UCMD_REQUIRE_SPEC=1 cargo test`).
       - name: Spec fixtures and oracle references from the umbrella repo
+        id: umbrella
         uses: actions/checkout@v4
+        continue-on-error: true
         with:
-          repository: mines-of-morja/UnitcellMD
+          repository: ${{ github.repository_owner }}/UnitcellMD
+          ref: ${{ env.UMBRELLA_REF }}
+          token: ${{ secrets.UMBRELLA_TOKEN || github.token }}
           path: _umbrella
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -25,10 +39,17 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Test (contract and reference tests run when the umbrella provides spec/ and tools/oracle/)
+      - name: Test, including the contract and oracle reference tests
+        if: steps.umbrella.outcome == 'success'
         run: cargo test --workspace
         env:
           UCMD_SPEC_DIR: ${{ github.workspace }}/_umbrella/spec
+          UCMD_REQUIRE_SPEC: "1"
+      - name: Test without the umbrella repo (contract and reference tests skipped)
+        if: steps.umbrella.outcome != 'success'
+        run: |
+          echo "::warning::Umbrella repo ${{ github.repository_owner }}/UnitcellMD@${{ env.UMBRELLA_REF }} not readable (private without the UMBRELLA_TOKEN secret?). Contract and oracle reference tests were skipped."
+          cargo test --workspace
       - name: Crate dependency rules
         run: scripts/check-architecture.sh
       - name: Build without HDF5 (ADR 0002/0004)
