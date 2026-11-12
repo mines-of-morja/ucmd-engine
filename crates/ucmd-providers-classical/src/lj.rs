@@ -134,9 +134,10 @@ impl ForceProvider for LennardJones {
         for a in 0..self.n_types {
             for b in 0..self.n_types {
                 let (sigma, epsilon, _) = self.pairs[a * self.n_types + b];
-                let x3 = (sigma / rc).powi(3);
+                let x = sigma / rc;
+                let x3 = x * x * x;
                 let x9 = x3 * x3 * x3;
-                let nn = counts[a] * counts[b] * epsilon * sigma.powi(3);
+                let nn = counts[a] * counts[b] * epsilon * sigma * sigma * sigma;
                 e += nn * (x9 / 3.0 - x3);
                 w += nn * (2.0 * x9 / 3.0 - x3);
             }
@@ -183,7 +184,8 @@ impl ForceProvider for LennardJones {
             let r2 = d.length_squared();
             if r2 < rc2 {
                 let (sigma, epsilon, shift) = pairs[type_of[i] * n_types + type_of[j]];
-                let s6 = (sigma * sigma / r2).powi(3);
+                let s2 = sigma * sigma / r2;
+                let s6 = s2 * s2 * s2;
                 energy += 4.0 * epsilon * (s6 * s6 - s6) - shift;
                 let f = d * (24.0 * epsilon * (2.0 * s6 * s6 - s6) / r2);
                 forces[i] += f;
@@ -224,7 +226,8 @@ impl ForceProvider for LennardJones {
 }
 
 fn lj_energy(sigma: f64, epsilon: f64, r2: f64) -> f64 {
-    let s6 = (sigma * sigma / r2).powi(3);
+    let s2 = sigma * sigma / r2;
+    let s6 = s2 * s2 * s2;
     4.0 * epsilon * (s6 * s6 - s6)
 }
 

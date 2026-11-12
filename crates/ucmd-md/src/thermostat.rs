@@ -1,9 +1,8 @@
 //! Thermostats as velocity operators (operator O of PLAN.md §2.5).
 
 use crate::kinetics::kinetic_energy;
-use rand::RngExt;
+use crate::random::{chi_squared, standard_normal};
 use rand_chacha::ChaCha8Rng;
-use rand_distr::{Distribution, Gamma, StandardNormal};
 use ucmd_core::Vec3;
 use ucmd_core::units::BOLTZMANN_KJMOL_K;
 
@@ -59,13 +58,11 @@ impl Thermostat for Csvr {
             return 0.0;
         }
         let target = 0.5 * dof * BOLTZMANN_KJMOL_K * self.temperature_k;
-        let c = (-dt_ps / self.tau_ps).exp();
-        let r1: f64 = self.rng.sample(StandardNormal);
+        let c = libm::exp(-dt_ps / self.tau_ps);
+        let r1 = standard_normal(&mut self.rng);
+        // S ~ χ²(N_f − 1); with a single degree of freedom there is no S term.
         let rest = if dof > 1.0 {
-            match Gamma::new(0.5 * (dof - 1.0), 2.0) {
-                Ok(chi2) => chi2.sample(&mut self.rng),
-                Err(_) => 0.0,
-            }
+            chi_squared(&mut self.rng, dof - 1.0)
         } else {
             0.0
         };

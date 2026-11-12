@@ -3,6 +3,7 @@
 //! This is the only crate that knows the concrete force providers ([`registry`]). It wires
 //! package, run configuration, machine profile, providers, dynamics and writers together.
 
+mod hardware;
 mod registry;
 mod runner;
 
@@ -299,6 +300,7 @@ fn h5md_writer(
                 system_json: s.system_json.clone(),
                 run_config_toml: s.config.resolved_toml(),
                 system_sha256: s.package.system.system_sha256.clone(),
+                hardware: hardware::describe(1),
             };
             ucmd_io::H5mdWriter::create(path, &s.package.system, options, &provenance)
         }
@@ -411,7 +413,7 @@ fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
         thermostat_rng: None,
     };
     eprintln!(
-        "ucmd {VERSION} ({GIT_HASH}): {} atoms, steps {start_step}..{} of {} fs, N_dof = {}{}",
+        "ucmd {VERSION} ({GIT_HASH}): {} atoms, steps {start_step}..{} of {} fs, N_dof = {}{}\n  hardware: {}",
         system.n_atoms(),
         start_step + steps,
         s.config.run.timestep_fs,
@@ -420,7 +422,8 @@ fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
             " (restart)"
         } else {
             ""
-        }
+        },
+        hardware::describe(1)
     );
     let started = Instant::now();
     let outcome = runner::drive(
@@ -495,6 +498,7 @@ fn export(run_toml: &Path, checkpoint: &Path, out: &Path) -> Result<()> {
         "created_by": format!("ucmd {VERSION} ({GIT_HASH}) export of checkpoint step {}", c.meta.step),
         "created_utc": utc_now(),
         "notes": format!("time {} ps of the run {}", c.meta.time_ps, run_toml.display()),
+        "hardware": hardware::describe(1),
         "derived_from": original,
     });
     std::fs::create_dir_all(out)?;

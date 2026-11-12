@@ -1,9 +1,8 @@
 //! Initial velocities.
 
 use crate::kinetics::{kinetic_energy, remove_com_velocity, temperature};
-use rand::RngExt;
+use crate::random::standard_normal;
 use rand_chacha::ChaCha8Rng;
-use rand_distr::StandardNormal;
 use ucmd_core::Vec3;
 use ucmd_core::units::BOLTZMANN_KJMOL_K;
 
@@ -23,7 +22,7 @@ pub fn maxwell_boltzmann(
         .iter()
         .map(|&m| {
             let sigma = (BOLTZMANN_KJMOL_K * temperature_k / m).sqrt();
-            let mut g = || rng.sample::<f64, _>(StandardNormal) * sigma;
+            let mut g = || standard_normal(rng) * sigma;
             Vec3::new(g(), g(), g())
         })
         .collect();
