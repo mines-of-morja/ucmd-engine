@@ -149,6 +149,7 @@ fn check(path: &Path) -> Result<()> {
 struct Setup {
     config: RunConfig,
     package: Package,
+    #[cfg_attr(not(feature = "h5md"), allow(dead_code))] // only the H5MD writer reads it so far
     machine: MachineProfile,
     system_json: String,
 }

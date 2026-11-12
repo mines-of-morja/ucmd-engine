@@ -24,3 +24,5 @@ jobs:
         run: cargo test --workspace
       - name: Crate dependency rules
         run: scripts/check-architecture.sh
+      - name: Build without HDF5 (ADR 0002/0004)
+        run: cargo build --workspace --no-default-features
