@@ -478,6 +478,70 @@ mod tests {
         assert!(worst <= 1e-10, "deviation {worst}");
     }
 
+    /// E1.6: CSVR samples the canonical ensemble. For 100 harmonic oscillators at 300 K:
+    /// ⟨K⟩ = N_f k_B T/2, Var(K) = N_f (k_B T)²/2 and, by equipartition, ⟨U⟩ = N_f k_B T/2. The
+    /// conserved quantity K + U − (thermostat work) stays constant up to integration error.
+    #[test]
+    fn csvr_samples_the_canonical_ensemble() {
+        use crate::random::{STREAM_THERMOSTAT, STREAM_VELOCITIES, stream};
+        use crate::thermostat::Csvr;
+        use crate::velocities::maxwell_boltzmann;
+        use ucmd_core::units::BOLTZMANN_KJMOL_K;
+
+        let n = 100;
+        let system = particles(&vec![39.948; n]);
+        let dof = 3.0 * n as f64;
+        let v0 = maxwell_boltzmann(
+            system.masses(),
+            300.0,
+            dof,
+            false,
+            &mut stream(7, STREAM_VELOCITIES),
+        );
+        let state = State::new(vec![Vec3::ZERO; n], Some(v0), None);
+        let thermostat = Box::new(Csvr::new(300.0, 0.1, stream(7, STREAM_THERMOSTAT)));
+        let mut md = Dynamics::new(
+            &system,
+            Tether(1000.0),
+            state,
+            DynamicsConfig::nve(0.002),
+            Some(thermostat),
+        )
+        .unwrap();
+        md.run(20_000, |_| {}).unwrap(); // 40 ps equilibration
+        let start = md.conserved_energy().unwrap();
+        let (mut k_sum, mut k2_sum, mut u_sum, mut samples) = (0.0, 0.0, 0.0, 0.0);
+        let mut drift = 0.0f64;
+        md.run(200_000, |m| {
+            if m.state().step % 20 == 0 {
+                let k = m.kinetic_energy();
+                k_sum += k;
+                k2_sum += k * k;
+                u_sum += m.potential_energy().unwrap();
+                samples += 1.0;
+                drift = drift.max((m.conserved_energy().unwrap() - start).abs());
+            }
+        })
+        .unwrap();
+        let kt = BOLTZMANN_KJMOL_K * 300.0;
+        let (k_mean, u_mean) = (k_sum / samples, u_sum / samples);
+        let k_var = k2_sum / samples - k_mean * k_mean;
+        let (k_rel, var_rel, u_rel) = (
+            k_mean / (0.5 * dof * kt) - 1.0,
+            k_var / (0.5 * dof * kt * kt) - 1.0,
+            u_mean / (0.5 * dof * kt) - 1.0,
+        );
+        eprintln!(
+            "CSVR: <K> {k_rel:+.4}, Var(K) {var_rel:+.4}, <U> {u_rel:+.4} (relative), conserved drift {:.2e} of <K>",
+            drift / k_mean
+        );
+        assert!(
+            k_rel.abs() < 0.01 && var_rel.abs() < 0.1 && u_rel.abs() < 0.03,
+            "{k_rel} {var_rel} {u_rel}"
+        );
+        assert!(drift / k_mean < 1e-3);
+    }
+
     /// A provider that fails at a given step leaves the last completed state untouched.
     #[test]
     fn provider_error_keeps_the_last_good_state() {
