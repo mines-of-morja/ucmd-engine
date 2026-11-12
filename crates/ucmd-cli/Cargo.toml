@@ -21,3 +21,6 @@ workspace = true
 [[bin]]
 name = "ucmd"
 path = "src/main.rs"
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 ucmd-core.workspace = true
 ucmd-force.workspace = true
+serde.workspace = true
 
 [lints]
 workspace = true
