@@ -10,6 +10,13 @@ publish.workspace = true
 [dependencies]
 ucmd-core.workspace = true
 ucmd-force.workspace = true
+thiserror.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+rand_distr.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+ucmd-force = { workspace = true, features = ["testkit"] }
