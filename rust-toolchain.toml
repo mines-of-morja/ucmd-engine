@@ -1,3 +1,6 @@
+# Pinned toolchain: local builds and CI use the same compiler and lints (ADR 0010).
+# Update deliberately, in its own commit, after running all checks.
 [toolchain]
-channel = "stable"
+channel = "1.100.0"
 components = ["rustfmt", "clippy"]
+profile = "minimal"

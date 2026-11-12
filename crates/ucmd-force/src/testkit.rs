@@ -285,13 +285,13 @@ mod tests {
             };
             out.energy = Some(half * self.k * x.iter().map(|r| r.length_squared()).sum::<f64>());
             let sign = if self.bug == Bug::SignFlip { 1.0 } else { -1.0 };
-            for i in 0..n {
+            for (i, force) in out.forces.iter_mut().enumerate().take(n) {
                 let source = if self.bug == Bug::OffByOne {
                     (i + 1) % n
                 } else {
                     i
                 };
-                out.forces[i] = sign * self.k * x[source];
+                *force = sign * self.k * x[source];
             }
             out.virial = Some(x.iter().zip(&out.forces).map(|(&r, &f)| outer(r, f)).sum());
             Ok(())

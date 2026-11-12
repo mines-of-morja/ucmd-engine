@@ -6,6 +6,9 @@
 mod registry;
 mod runner;
 
+// The i-PI providers are registered in E3.1; the dependency already exists for the crate graph.
+use ucmd_providers_ipi as _;
+
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
