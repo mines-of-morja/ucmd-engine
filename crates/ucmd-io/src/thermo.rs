@@ -21,6 +21,46 @@ fn num(x: Option<f64>) -> String {
 }
 
 impl ThermoWriter {
+    /// Reopen after a restart: keep the header and the lines up to `last_step`, then append.
+    pub fn open_append(path: &Path, every: u64, last_step: u64) -> Result<Self, ObserverError> {
+        let text = std::fs::read_to_string(path).map_err(io)?;
+        let mut kept = String::new();
+        let mut terms = None;
+        for line in text.lines() {
+            if let Some(header) = line.strip_prefix("# ") {
+                terms = Some(
+                    header
+                        .split('\t')
+                        .filter_map(|c| {
+                            c.strip_prefix("term:")
+                                .and_then(|c| c.strip_suffix("_kjmol"))
+                        })
+                        .map(String::from)
+                        .collect(),
+                );
+            } else if line
+                .split('\t')
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .is_none_or(|step| step > last_step)
+            {
+                continue;
+            }
+            kept.push_str(line);
+            kept.push('\n');
+        }
+        std::fs::write(path, kept).map_err(io)?;
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .map_err(io)?;
+        Ok(Self {
+            out: BufWriter::new(file),
+            every: every.max(1),
+            terms,
+        })
+    }
+
     /// Create (or truncate) `path`, writing every `every` steps.
     pub fn create(path: &Path, every: u64) -> Result<Self, ObserverError> {
         Ok(Self {

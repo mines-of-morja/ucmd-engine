@@ -406,6 +406,18 @@ impl RunConfig {
         Ok(())
     }
 
+    /// SHA-256 (hex) of the resolved configuration without the run length: a restart may
+    /// extend a run, but not change anything else.
+    pub fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut copy = self.clone();
+        copy.run.steps = 0;
+        Sha256::digest(copy.resolved_toml().as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
     /// The fully resolved configuration as TOML, for provenance.
     pub fn resolved_toml(&self) -> String {
         toml::to_string(self)

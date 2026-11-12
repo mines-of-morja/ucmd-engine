@@ -1016,6 +1016,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "rand_chacha 0.10.0",
  "serde",
  "serde_json",
  "toml",

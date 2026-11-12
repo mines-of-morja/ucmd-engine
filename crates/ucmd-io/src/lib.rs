@@ -9,8 +9,11 @@
 //! - Writers (observers): [`ThermoWriter`] (TSV), [`XyzWriter`] (extended XYZ, Å, for viewers),
 //!   `H5mdWriter` (feature `h5md`, spec/trajectory-h5md.md).
 //!
-//! Planned: checkpoints (E1.10), H5MD reader for `ucmd rerun`.
+//! - [`Checkpoint`]: exact restart files (spec/checkpoint.md).
+//!
+//! Planned: H5MD reader for `ucmd rerun`.
 
+pub mod checkpoint;
 pub mod config;
 pub mod elements;
 pub mod error;
@@ -21,6 +24,7 @@ pub mod package;
 pub mod thermo;
 pub mod xyz;
 
+pub use checkpoint::{Checkpoint, CheckpointError, CheckpointMeta};
 pub use config::{
     FileOutput, Integrator, MachineProfile, MomentumSection, OutputSection, RunConfig,
     ThermostatSection, TrajectoryOutput, VelocitiesSection, load_run_config,

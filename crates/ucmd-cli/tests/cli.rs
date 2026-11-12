@@ -163,3 +163,120 @@ fn argon_run_writes_a_spec_valid_trajectory() {
         eprintln!("ucmd-spec not installed; trajectory not validated");
     }
 }
+
+/// E1.10: 200 steps in one go equal 100 steps + restart + 100 steps, bitwise (CSVR included:
+/// its random generator state travels in the checkpoint), and the outputs are identical.
+#[test]
+fn restart_is_bitwise_identical() {
+    let Some(spec) = spec() else { return };
+    let base = std::fs::read_to_string(spec.join("fixtures/runs/argon-nvt.toml"))
+        .unwrap()
+        .replace(
+            "system = \"../valid/argon-864\"",
+            "system = \"system.ucsys\"",
+        )
+        .replace("every = 5000", "every = 100")
+        .replace(
+            "[output.trajectory]\nfile = \"trajectory.h5\"\nevery = 100",
+            "[output.trajectory]\nfile = \"trajectory.h5\"\nevery = 50",
+        );
+    let full = run_dir(
+        "restart-full",
+        &spec,
+        "argon-864",
+        &base.replace("steps = 25000", "steps = 200"),
+    );
+    assert!(
+        ucmd()
+            .arg("run")
+            .arg(full.join("run.toml"))
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let split = run_dir(
+        "restart-split",
+        &spec,
+        "argon-864",
+        &base.replace("steps = 25000", "steps = 100"),
+    );
+    assert!(
+        ucmd()
+            .arg("run")
+            .arg(split.join("run.toml"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(
+        split.join("run.toml"),
+        base.replace("steps = 25000", "steps = 200"),
+    )
+    .unwrap();
+    let status = ucmd()
+        .arg("run")
+        .arg(split.join("run.toml"))
+        .arg("--restart")
+        .arg(split.join("out/checkpoint.ucchk"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let a = ucmd_io::Checkpoint::read(&full.join("out/checkpoint.ucchk")).unwrap();
+    let b = ucmd_io::Checkpoint::read(&split.join("out/checkpoint.ucchk")).unwrap();
+    assert_eq!((a.meta.step, b.meta.step), (200, 200));
+    let bits = |v: &[ucmd_core::Vec3]| {
+        v.iter()
+            .flat_map(|x| x.to_array().map(f64::to_bits))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        bits(&a.state.positions),
+        bits(&b.state.positions),
+        "positions differ"
+    );
+    assert_eq!(
+        bits(&a.state.velocities),
+        bits(&b.state.velocities),
+        "velocities differ"
+    );
+    assert_eq!(
+        a.meta.thermostat_work_kjmol.to_bits(),
+        b.meta.thermostat_work_kjmol.to_bits()
+    );
+    assert_eq!(a.meta.thermostat_rng, b.meta.thermostat_rng);
+    let thermo = |d: &Path| std::fs::read_to_string(d.join("out/thermo.tsv")).unwrap();
+    assert_eq!(thermo(&full), thermo(&split), "thermo tables differ");
+
+    // a changed configuration is refused
+    std::fs::write(
+        split.join("run.toml"),
+        base.replace("steps = 25000", "steps = 300")
+            .replace("tau_ps = 0.5", "tau_ps = 0.6"),
+    )
+    .unwrap();
+    let refused = ucmd()
+        .arg("run")
+        .arg(split.join("run.toml"))
+        .arg("--restart")
+        .arg(split.join("out/checkpoint.ucchk"))
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("E_RESTART_MISMATCH"));
+
+    let validator = spec.join("validator/.venv/bin/ucmd-spec");
+    if validator.is_file() {
+        let output = Command::new(validator)
+            .arg("validate-trajectory")
+            .arg(split.join("out/trajectory.h5"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+}

@@ -133,6 +133,45 @@ impl Series {
         })
     }
 
+    /// Reopen an existing element and cut it back to the frames with step <= `last_step`.
+    fn open(parent: &Group, name: &str, last_step: u64) -> Result<Option<Self>, ObserverError> {
+        if !parent.link_exists(name) {
+            return Ok(None);
+        }
+        let g = parent.group(name).map_err(err(name))?;
+        let step = g.dataset("step").map_err(err(name))?;
+        let time = g.dataset("time").map_err(err(name))?;
+        let value = g.dataset("value").map_err(err(name))?;
+        let steps: Vec<i64> = step.read_raw().map_err(err(name))?;
+        let count = steps
+            .iter()
+            .take_while(|&&k| u64::try_from(k).is_ok_and(|k| k <= last_step))
+            .count();
+        let shape = value.shape();
+        let frame = shape[1..].to_vec();
+        let float32 = value.dtype().map(|d| d.size() == 4).unwrap_or(false);
+        step.resize(count).map_err(err(name))?;
+        time.resize(count).map_err(err(name))?;
+        match frame.as_slice() {
+            [] => value.resize(count),
+            [a, b] => value.resize((count, *a, *b)),
+            _ => {
+                return Err(ObserverError(format!(
+                    "H5MD {name}: unsupported frame shape {frame:?}"
+                )));
+            }
+        }
+        .map_err(err(name))?;
+        Ok(Some(Self {
+            step,
+            time,
+            value,
+            frame,
+            float32,
+            count,
+        }))
+    }
+
     fn append(&mut self, step: u64, time_ps: f64, data: &[f64]) -> Result<(), ObserverError> {
         let k = self.count;
         let context = "append";
@@ -358,6 +397,86 @@ impl H5mdWriter {
             pressure: None,
             terms: Vec::new(),
             first: true,
+        })
+    }
+}
+
+impl H5mdWriter {
+    /// Reopen after a restart: every element is cut back to the frames up to `last_step` and
+    /// writing continues from there (spec/checkpoint.md).
+    pub fn open_append(
+        path: &Path,
+        system: &System,
+        options: H5mdOptions,
+        last_step: u64,
+    ) -> Result<Self, ObserverError> {
+        let missing = |what: &str| {
+            ObserverError(format!(
+                "H5MD restart: {what} missing in {}",
+                path.display()
+            ))
+        };
+        let file = File::open_rw(path).map_err(err("open"))?;
+        let all = file.group("particles/all").map_err(err("particles/all"))?;
+        let box_group = all.group("box").map_err(err("box"))?;
+        let edges =
+            Series::open(&box_group, "edges", last_step)?.ok_or_else(|| missing("box/edges"))?;
+        let position =
+            Series::open(&all, "position", last_step)?.ok_or_else(|| missing("position"))?;
+        let velocity = if options.velocities {
+            Some(Series::open(&all, "velocity", last_step)?.ok_or_else(|| missing("velocity"))?)
+        } else {
+            None
+        };
+        let force = if options.forces {
+            Some(Series::open(&all, "force", last_step)?.ok_or_else(|| missing("force"))?)
+        } else {
+            None
+        };
+        let observables = file.group("observables").map_err(err("observables"))?;
+        let mut scalars = Vec::new();
+        for name in [
+            "potential_energy",
+            "kinetic_energy",
+            "conserved_energy",
+            "temperature",
+            "volume",
+        ] {
+            if let Some(series) = Series::open(&observables, name, last_step)? {
+                scalars.push((name.to_string(), series));
+            }
+        }
+        let pressure = match (
+            Series::open(&observables, "pressure", last_step)?,
+            Series::open(&observables, "pressure_tensor", last_step)?,
+        ) {
+            (Some(p), Some(t)) => Some((p, t)),
+            _ => None,
+        };
+        let mut terms = Vec::new();
+        if observables.link_exists("energy_terms") {
+            let group = observables
+                .group("energy_terms")
+                .map_err(err("energy_terms"))?;
+            for member in group.member_names().map_err(err("energy_terms"))? {
+                if let Some(series) = Series::open(&group, &member, last_step)? {
+                    terms.push((member.replace(':', "/"), series));
+                }
+            }
+        }
+        Ok(Self {
+            file,
+            options,
+            n_atoms: system.n_atoms(),
+            position,
+            velocity,
+            force,
+            edges,
+            observables,
+            scalars,
+            pressure,
+            terms,
+            first: false,
         })
     }
 }

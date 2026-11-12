@@ -4,6 +4,7 @@
 //! package, run configuration, machine profile, providers, dynamics and writers together.
 
 mod registry;
+mod runner;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
@@ -43,6 +44,12 @@ enum Command {
     Run {
         /// The run configuration.
         run_toml: PathBuf,
+        /// Continue from this checkpoint; outputs are cut back to its step and appended.
+        #[arg(long)]
+        restart: Option<PathBuf>,
+        /// Restart even if the package or configuration differ from the checkpoint's.
+        #[arg(long)]
+        force: bool,
     },
     /// Evaluate the providers once on the initial state and print energies as JSON.
     Singlepoint {
@@ -58,7 +65,11 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Check { path } => check(&path),
-        Command::Run { run_toml } => run(&run_toml),
+        Command::Run {
+            run_toml,
+            restart,
+            force,
+        } => run(&run_toml, restart.as_deref(), force),
         Command::Singlepoint { run_toml, forces } => singlepoint(&run_toml, forces.as_deref()),
     };
     match result {
@@ -191,69 +202,106 @@ fn initial_state(s: &Setup, dof: f64) -> State {
     state
 }
 
-fn observers(s: &Setup) -> Result<Vec<Box<dyn Observer>>> {
+fn observers(s: &Setup, restart_step: Option<u64>) -> Result<Vec<Box<dyn Observer>>> {
     let mut list: Vec<Box<dyn Observer>> = Vec::new();
     let Some(output) = &s.config.output else {
         return Ok(list);
     };
     let dir = s.config.output_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let e = |e: ucmd_force::ObserverError| anyhow!("{e}");
     if let Some(thermo) = &output.thermo {
-        list.push(Box::new(
-            ucmd_io::ThermoWriter::create(&dir.join(&thermo.file), thermo.every)
-                .map_err(|e| anyhow!("{e}"))?,
-        ));
+        let path = dir.join(&thermo.file);
+        list.push(Box::new(match restart_step {
+            Some(step) => {
+                ucmd_io::ThermoWriter::open_append(&path, thermo.every, step).map_err(e)?
+            }
+            None => ucmd_io::ThermoWriter::create(&path, thermo.every).map_err(e)?,
+        }));
     }
     if let Some(trajectory) = &output.trajectory {
         let path = dir.join(&trajectory.file);
-        if path.extension().is_some_and(|e| e == "xyz") {
-            let writer =
-                ucmd_io::XyzWriter::create(&path, trajectory.every, s.package.system.elements())
-                    .map_err(|e| anyhow!("{e}"))?;
-            list.push(Box::new(writer));
+        let elements = s.package.system.elements();
+        if path.extension().is_some_and(|x| x == "xyz") {
+            list.push(Box::new(match restart_step {
+                Some(step) => {
+                    ucmd_io::XyzWriter::open_append(&path, trajectory.every, elements, step)
+                        .map_err(e)?
+                }
+                None => ucmd_io::XyzWriter::create(&path, trajectory.every, elements).map_err(e)?,
+            }));
         } else {
-            list.push(h5md_writer(s, &path, trajectory)?);
+            list.push(h5md_writer(s, &path, trajectory, restart_step)?);
         }
     }
     Ok(list)
 }
 
 #[cfg(feature = "h5md")]
-fn h5md_writer(s: &Setup, path: &Path, t: &ucmd_io::TrajectoryOutput) -> Result<Box<dyn Observer>> {
+fn h5md_writer(
+    s: &Setup,
+    path: &Path,
+    t: &ucmd_io::TrajectoryOutput,
+    restart_step: Option<u64>,
+) -> Result<Box<dyn Observer>> {
     let options = ucmd_io::H5mdOptions {
         every: t.every,
         velocities: t.velocities,
         forces: t.forces,
         float32: t.precision.as_deref() == Some("float32"),
     };
-    let provenance = ucmd_io::H5mdProvenance {
-        engine_version: VERSION.into(),
-        git_hash: GIT_HASH.into(),
-        author: s
-            .machine
-            .author_name
-            .clone()
-            .unwrap_or_else(|| "anonymous".into()),
-        system_json: s.system_json.clone(),
-        run_config_toml: s.config.resolved_toml(),
-        system_sha256: s.package.system.system_sha256.clone(),
-    };
-    let writer = ucmd_io::H5mdWriter::create(path, &s.package.system, options, &provenance)
-        .map_err(|e| anyhow!("{e}"))?;
+    let writer = match restart_step {
+        Some(step) => ucmd_io::H5mdWriter::open_append(path, &s.package.system, options, step),
+        None => {
+            let provenance = ucmd_io::H5mdProvenance {
+                engine_version: VERSION.into(),
+                git_hash: GIT_HASH.into(),
+                author: s
+                    .machine
+                    .author_name
+                    .clone()
+                    .unwrap_or_else(|| "anonymous".into()),
+                system_json: s.system_json.clone(),
+                run_config_toml: s.config.resolved_toml(),
+                system_sha256: s.package.system.system_sha256.clone(),
+            };
+            ucmd_io::H5mdWriter::create(path, &s.package.system, options, &provenance)
+        }
+    }
+    .map_err(|e| anyhow!("{e}"))?;
     Ok(Box::new(writer))
 }
 
 #[cfg(not(feature = "h5md"))]
-fn h5md_writer(_: &Setup, path: &Path, _: &ucmd_io::TrajectoryOutput) -> Result<Box<dyn Observer>> {
+fn h5md_writer(
+    _: &Setup,
+    path: &Path,
+    _: &ucmd_io::TrajectoryOutput,
+    _: Option<u64>,
+) -> Result<Box<dyn Observer>> {
     bail!(
         "{}: this build has no H5MD support (feature \"h5md\"); use a .xyz trajectory",
         path.display()
     )
 }
 
-fn run(run_toml: &Path) -> Result<()> {
+fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
     let s = setup(run_toml)?;
     let system = &s.package.system;
+    let checkpoint = restart
+        .map(ucmd_io::Checkpoint::read)
+        .transpose()
+        .map_err(|e| anyhow!("{e}"))?;
+    let fingerprint = s.config.fingerprint();
+    if let Some(c) = &checkpoint {
+        let same =
+            c.meta.system_sha256 == system.system_sha256 && c.meta.run_config_sha256 == fingerprint;
+        if !same && !force {
+            bail!(
+                "E_RESTART_MISMATCH  the package or run configuration differ from the checkpoint's (use --force to override)"
+            );
+        }
+    }
     let removed_angular = s.config.momentum.as_ref().is_some_and(|m| m.remove_angular);
     let dof = degrees_of_freedom(
         system.n_atoms(),
@@ -261,17 +309,25 @@ fn run(run_toml: &Path) -> Result<()> {
         true,
         removed_angular,
     );
-    let state = initial_state(&s, dof);
+    let state = match &checkpoint {
+        Some(c) => c.state.clone(),
+        None => initial_state(&s, dof),
+    };
     let thermostat: Option<Box<dyn Thermostat>> = match &s.config.thermostat {
         None => None,
         Some(ThermostatSection::Csvr {
             temperature_k,
             tau_ps,
-        }) => Some(Box::new(Csvr::new(
-            *temperature_k,
-            *tau_ps,
-            stream(s.config.run.seed, STREAM_THERMOSTAT),
-        ))),
+        }) => {
+            let rng = match checkpoint
+                .as_ref()
+                .and_then(|c| c.meta.thermostat_rng.clone())
+            {
+                Some(saved) => serde_json::from_value::<rand_chacha::ChaCha8Rng>(saved)?,
+                None => stream(s.config.run.seed, STREAM_THERMOSTAT),
+            };
+            Some(Box::new(Csvr::new(*temperature_k, *tau_ps, rng)))
+        }
         Some(other) => bail!("thermostat {other:?} arrives in E2.6; available: csvr"),
     };
     if s.config.barostat.is_some() {
@@ -287,20 +343,64 @@ fn run(run_toml: &Path) -> Result<()> {
     };
     let mut dynamics =
         Dynamics::new(system, provider, state, config, thermostat).map_err(|e| anyhow!("{e}"))?;
-    let mut observers = observers(&s)?;
-    let steps = s.config.run.steps;
+    let start_step = dynamics.state().step;
+    if let Some(c) = &checkpoint {
+        dynamics.restore_thermostat_work(c.meta.thermostat_work_kjmol);
+    }
+    let mut observers = observers(&s, checkpoint.as_ref().map(|c| c.meta.step))?;
+    let steps = s.config.run.steps.saturating_sub(start_step);
+    let out_dir = s.config.output_dir();
+    std::fs::create_dir_all(&out_dir)?;
+    let plan = s
+        .config
+        .output
+        .as_ref()
+        .and_then(|o| o.checkpoint.as_ref())
+        .map(|c| runner::CheckpointPlan {
+            path: out_dir.join(&c.file),
+            every: c.every.max(1),
+        });
+    let emergency = plan.as_ref().map_or_else(
+        || out_dir.join("emergency.ucchk"),
+        |p| p.path.with_extension("emergency.ucchk"),
+    );
+    let base = ucmd_io::CheckpointMeta {
+        spec_version: s.config.spec_version.clone(),
+        engine_version: VERSION.into(),
+        engine_git_hash: GIT_HASH.into(),
+        system_sha256: system.system_sha256.clone(),
+        run_config_sha256: fingerprint,
+        step: 0,
+        time_ps: 0.0,
+        thermostat_work_kjmol: 0.0,
+        thermostat_rng: None,
+    };
     eprintln!(
-        "ucmd {VERSION} ({GIT_HASH}): {} atoms, {steps} steps of {} fs, N_dof = {}",
+        "ucmd {VERSION} ({GIT_HASH}): {} atoms, steps {start_step}..{} of {} fs, N_dof = {}{}",
         system.n_atoms(),
+        start_step + steps,
         s.config.run.timestep_fs,
-        dynamics.degrees_of_freedom()
+        dynamics.degrees_of_freedom(),
+        if checkpoint.is_some() {
+            " (restart)"
+        } else {
+            ""
+        }
     );
     let started = Instant::now();
-    let outcome = dynamics.run_observed(steps, &mut observers, true);
+    let outcome = runner::drive(
+        &mut dynamics,
+        steps,
+        &mut observers,
+        checkpoint.is_none(),
+        plan.as_ref(),
+        &emergency,
+        &base,
+    );
     for observer in &mut observers {
         observer.finish().map_err(|e| anyhow!("{e}"))?;
     }
-    outcome.map_err(|e| anyhow!("{e}"))?;
+    outcome?;
     let seconds = started.elapsed().as_secs_f64();
     let ns = steps as f64 * s.config.run.timestep_fs * 1e-6;
     eprintln!(

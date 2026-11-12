@@ -25,12 +25,56 @@ fn io(e: std::io::Error) -> ObserverError {
 impl XyzWriter {
     /// Create (or truncate) `path`; `elements` are atomic numbers (0 is written as "X").
     pub fn create(path: &Path, every: u64, elements: &[u8]) -> Result<Self, ObserverError> {
+        Self::open(path, every, elements, false)
+    }
+
+    /// Reopen after a restart: keep the frames up to `last_step`, then append.
+    pub fn open_append(
+        path: &Path,
+        every: u64,
+        elements: &[u8],
+        last_step: u64,
+    ) -> Result<Self, ObserverError> {
+        let text = std::fs::read_to_string(path).map_err(io)?;
+        let lines: Vec<&str> = text.lines().collect();
+        let mut kept = String::new();
+        let mut at = 0;
+        while at < lines.len() {
+            let n: usize = lines[at].trim().parse().map_err(|_| {
+                ObserverError(format!("xyz trajectory: bad frame at line {}", at + 1))
+            })?;
+            let step = lines
+                .get(at + 1)
+                .and_then(|c| c.split_whitespace().find_map(|w| w.strip_prefix("step=")))
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(u64::MAX);
+            if step > last_step || at + 2 + n > lines.len() {
+                break;
+            }
+            for line in &lines[at..at + 2 + n] {
+                kept.push_str(line);
+                kept.push('\n');
+            }
+            at += 2 + n;
+        }
+        std::fs::write(path, kept).map_err(io)?;
+        Self::open(path, every, elements, true)
+    }
+
+    fn open(path: &Path, every: u64, elements: &[u8], append: bool) -> Result<Self, ObserverError> {
         let symbols = elements
             .iter()
             .map(|&z| symbol(z).unwrap_or("X").to_string())
             .collect();
+        let file = File::options()
+            .create(true)
+            .write(true)
+            .append(append)
+            .truncate(!append)
+            .open(path)
+            .map_err(io)?;
         Ok(Self {
-            out: BufWriter::new(File::create(path).map_err(io)?),
+            out: BufWriter::new(file),
             every: every.max(1),
             symbols,
         })
