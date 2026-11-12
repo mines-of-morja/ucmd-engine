@@ -1066,6 +1066,7 @@ dependencies = [
 name = "ucmd-providers-classical"
 version = "0.0.0"
 dependencies = [
+ "libm",
  "serde",
  "ucmd-core",
  "ucmd-force",

@@ -11,6 +11,7 @@ publish.workspace = true
 ucmd-core.workspace = true
 ucmd-force.workspace = true
 serde.workspace = true
+libm.workspace = true
 
 [lints]
 workspace = true
