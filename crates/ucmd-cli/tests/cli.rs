@@ -278,6 +278,9 @@ fn assert_restart_is_bitwise(name: &str, spec: &Path, base: &str) -> PathBuf {
     );
     let thermo = |d: &Path| std::fs::read_to_string(d.join("out/thermo.tsv")).unwrap();
     assert_eq!(thermo(&full), thermo(&split), "thermo tables differ");
+    // the whole files, metadata included: every f64 of it must survive the restart exactly
+    let bytes = |d: &Path| std::fs::read(d.join("out/checkpoint.ucchk")).unwrap();
+    assert!(bytes(&full) == bytes(&split), "checkpoint files differ");
     split
 }
 

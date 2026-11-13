@@ -3,8 +3,8 @@
 //! Layout (format version 2, little endian; version 1 lacks `thermostat_state` and is still read):
 //! `b"UCMDCHK\0"`, u32 format version, u64 JSON length, JSON metadata, u64 atom count,
 //! positions (3N f64), velocities (3N f64), u8 cell flag, then if set the cell rows (9 f64) and
-//! the periodic flags (3 u8). f64 values in the JSON use shortest round-trip formatting, so
-//! they are exact.
+//! the periodic flags (3 u8). f64 values in the JSON use shortest round-trip formatting and are
+//! parsed with correct rounding (serde_json's `float_roundtrip`), so they are exact.
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -249,6 +249,46 @@ mod tests {
             bits(&back.meta.thermostat_state),
             bits(&checkpoint.meta.thermostat_state)
         );
+    }
+
+    /// Every f64 of the metadata survives the JSON round trip bit for bit: thermostat work and
+    /// chain state of many magnitudes, including the value M2a found off by one ulp.
+    #[test]
+    fn metadata_floats_round_trip_exactly() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut values = vec![10708.003345271949, 10708.00334527195, -0.1 / 3.0];
+        for _ in 0..20_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let v = f64::from_bits(x);
+            if v.is_finite() {
+                values.push(v);
+            }
+            // typical magnitudes of energies and chain variables
+            values.push((x >> 11) as f64 / (1u64 << 53) as f64 * 2e4 - 1e4);
+        }
+        let meta = CheckpointMeta {
+            spec_version: "0.1.0".into(),
+            engine_version: "0.0.0".into(),
+            engine_git_hash: "abc".into(),
+            system_sha256: "s".into(),
+            run_config_sha256: "r".into(),
+            step: 1,
+            time_ps: 0.001,
+            thermostat_work_kjmol: values[0],
+            thermostat_rng: None,
+            thermostat_state: values.clone(),
+        };
+        let json = serde_json::to_vec(&meta).unwrap();
+        let back: CheckpointMeta = serde_json::from_slice(&json).unwrap();
+        let wrong = values
+            .iter()
+            .zip(&back.thermostat_state)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        assert_eq!(wrong, 0, "{wrong} of {} values changed", values.len());
+        assert_eq!(back.thermostat_work_kjmol.to_bits(), values[0].to_bits());
     }
 
     /// Version 1 checkpoints (E1, without `thermostat_state`) are still read.
