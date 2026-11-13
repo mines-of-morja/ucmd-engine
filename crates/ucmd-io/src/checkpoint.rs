@@ -1,6 +1,6 @@
 //! Checkpoints (spec/checkpoint.md): enough to continue a run bitwise identically.
 //!
-//! Layout (format version 1, little endian):
+//! Layout (format version 2, little endian; version 1 lacks `thermostat_state` and is still read):
 //! `b"UCMDCHK\0"`, u32 format version, u64 JSON length, JSON metadata, u64 atom count,
 //! positions (3N f64), velocities (3N f64), u8 cell flag, then if set the cell rows (9 f64) and
 //! the periodic flags (3 u8). f64 values in the JSON use shortest round-trip formatting, so
@@ -11,7 +11,9 @@ use std::path::Path;
 use ucmd_core::{Cell, State, Vec3};
 
 const MAGIC: &[u8; 8] = b"UCMDCHK\0";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
+/// Oldest format version this build reads.
+const OLDEST_READABLE: u32 = 1;
 
 /// Metadata of a checkpoint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -35,6 +37,10 @@ pub struct CheckpointMeta {
     pub thermostat_work_kjmol: f64,
     /// Serialized state of the thermostat's random generator, if any.
     pub thermostat_rng: Option<serde_json::Value>,
+    /// The thermostat's internal variables (Nosé–Hoover chain: ξ₁…ξ_M, then v_ξ₁…v_ξ_M, in
+    /// dimensionless and ps⁻¹ units). Empty for thermostats without such state (format v2).
+    #[serde(default)]
+    pub thermostat_state: Vec<f64>,
 }
 
 /// A checkpoint: metadata and state arrays.
@@ -113,9 +119,9 @@ impl Checkpoint {
             return Err(fail("not a UnitcellMD checkpoint"));
         }
         let version = cursor.u32().ok_or_else(|| fail("truncated"))?;
-        if version != FORMAT_VERSION {
+        if !(OLDEST_READABLE..=FORMAT_VERSION).contains(&version) {
             return Err(fail(&format!(
-                "format version {version} (supported: {FORMAT_VERSION})"
+                "format version {version} (supported: {OLDEST_READABLE} to {FORMAT_VERSION})"
             )));
         }
         let json_len = usize::try_from(cursor.u64().ok_or_else(|| fail("truncated"))?)
@@ -224,6 +230,7 @@ mod tests {
                 time_ps: state.time_ps,
                 thermostat_work_kjmol: -0.1 / 3.0,
                 thermostat_rng: Some(serde_json::json!({"seed": [1, 2, 3]})),
+                thermostat_state: vec![-0.1 / 3.0, 1e-300, -0.0, 2.0f64.powi(60) + 1.0],
             },
             state,
         };
@@ -237,6 +244,56 @@ mod tests {
             back.meta.thermostat_work_kjmol.to_bits(),
             checkpoint.meta.thermostat_work_kjmol.to_bits()
         );
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(
+            bits(&back.meta.thermostat_state),
+            bits(&checkpoint.meta.thermostat_state)
+        );
+    }
+
+    /// Version 1 checkpoints (E1, without `thermostat_state`) are still read.
+    #[test]
+    fn reads_format_version_1() {
+        let mut state = State::new(vec![Vec3::new(0.1, 0.2, 0.3)], None, None);
+        state.step = 7;
+        state.time_ps = 0.028;
+        let meta = CheckpointMeta {
+            spec_version: "0.1.0".into(),
+            engine_version: "0.0.0".into(),
+            engine_git_hash: "abc".into(),
+            system_sha256: "s".into(),
+            run_config_sha256: "r".into(),
+            step: 7,
+            time_ps: 0.028,
+            thermostat_work_kjmol: 0.5,
+            thermostat_rng: None,
+            thermostat_state: Vec::new(),
+        };
+        let path =
+            std::env::temp_dir().join(format!("ucmd-checkpoint-v1-{}.ucchk", std::process::id()));
+        Checkpoint {
+            meta: meta.clone(),
+            state: state.clone(),
+        }
+        .write(&path)
+        .unwrap();
+        // rewrite as version 1: old version number, JSON without the new key
+        let bytes = std::fs::read(&path).unwrap();
+        let json_len = u64::from_le_bytes(bytes[12..20].try_into().unwrap()) as usize;
+        let json = std::str::from_utf8(&bytes[20..20 + json_len]).unwrap();
+        let old_json = json.replace(",\"thermostat_state\":[]", "");
+        assert_ne!(old_json, json);
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(MAGIC);
+        v1.extend_from_slice(&1u32.to_le_bytes());
+        v1.extend_from_slice(&(old_json.len() as u64).to_le_bytes());
+        v1.extend_from_slice(old_json.as_bytes());
+        v1.extend_from_slice(&bytes[20 + json_len..]);
+        std::fs::write(&path, &v1).unwrap();
+        let back = Checkpoint::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(back.meta, meta);
+        assert_eq!(back.state, state);
     }
 
     #[test]

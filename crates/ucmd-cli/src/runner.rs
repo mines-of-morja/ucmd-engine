@@ -32,6 +32,7 @@ pub fn checkpoint_of<P: ForceProvider>(
             time_ps: state.time_ps,
             thermostat_work_kjmol: dynamics.thermostat_work(),
             thermostat_rng,
+            thermostat_state: dynamics.thermostat_state(),
             ..base.clone()
         },
         state,
@@ -147,6 +148,7 @@ mod tests {
             time_ps: 0.0,
             thermostat_work_kjmol: 0.0,
             thermostat_rng: None,
+            thermostat_state: Vec::new(),
         }
     }
 

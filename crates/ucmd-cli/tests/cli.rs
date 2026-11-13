@@ -164,12 +164,9 @@ fn argon_run_writes_a_spec_valid_trajectory() {
     }
 }
 
-/// E1.10: 200 steps in one go equal 100 steps + restart + 100 steps, bitwise (CSVR included:
-/// its random generator state travels in the checkpoint), and the outputs are identical.
-#[test]
-fn restart_is_bitwise_identical() {
-    let Some(spec) = spec() else { return };
-    let base = std::fs::read_to_string(spec.join("fixtures/runs/argon-nvt.toml"))
+/// The argon NVT fixture with checkpoints every 100 steps and frames every 50 steps.
+fn restart_base(spec: &Path) -> String {
+    std::fs::read_to_string(spec.join("fixtures/runs/argon-nvt.toml"))
         .unwrap()
         .replace(
             "system = \"../valid/argon-864\"",
@@ -179,10 +176,16 @@ fn restart_is_bitwise_identical() {
         .replace(
             "[output.trajectory]\nfile = \"trajectory.h5\"\nevery = 100",
             "[output.trajectory]\nfile = \"trajectory.h5\"\nevery = 50",
-        );
+        )
+}
+
+/// Run `base` (with `steps = 25000`) for 200 steps in one go and as 100 steps + restart + 100
+/// steps. The end states, the thermostat state and the thermo tables must agree bitwise.
+/// Returns the directory of the split run.
+fn assert_restart_is_bitwise(name: &str, spec: &Path, base: &str) -> PathBuf {
     let full = run_dir(
-        "restart-full",
-        &spec,
+        &format!("{name}-full"),
+        spec,
         "argon-864",
         &base.replace("steps = 25000", "steps = 200"),
     );
@@ -196,8 +199,8 @@ fn restart_is_bitwise_identical() {
     );
 
     let split = run_dir(
-        "restart-split",
-        &spec,
+        &format!("{name}-split"),
+        spec,
         "argon-864",
         &base.replace("steps = 25000", "steps = 100"),
     );
@@ -246,8 +249,24 @@ fn restart_is_bitwise_identical() {
         b.meta.thermostat_work_kjmol.to_bits()
     );
     assert_eq!(a.meta.thermostat_rng, b.meta.thermostat_rng);
+    let state_bits = |s: &[f64]| s.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(
+        state_bits(&a.meta.thermostat_state),
+        state_bits(&b.meta.thermostat_state),
+        "thermostat state differs"
+    );
     let thermo = |d: &Path| std::fs::read_to_string(d.join("out/thermo.tsv")).unwrap();
     assert_eq!(thermo(&full), thermo(&split), "thermo tables differ");
+    split
+}
+
+/// E1.10: 200 steps in one go equal 100 steps + restart + 100 steps, bitwise (CSVR included:
+/// its random generator state travels in the checkpoint), and the outputs are identical.
+#[test]
+fn restart_is_bitwise_identical() {
+    let Some(spec) = spec() else { return };
+    let base = restart_base(&spec);
+    let split = assert_restart_is_bitwise("restart", &spec, &base);
 
     // a changed configuration is refused
     std::fs::write(
@@ -279,6 +298,43 @@ fn restart_is_bitwise_identical() {
             String::from_utf8_lossy(&output.stdout)
         );
     }
+}
+
+/// E2.6: the Nosé–Hoover chain variables travel in the checkpoint (format v2), so a restart
+/// is bitwise identical; the chain moves away from its initial state.
+#[test]
+fn restart_with_nose_hoover_chain_is_bitwise_identical() {
+    let Some(spec) = spec() else { return };
+    let base = restart_base(&spec).replace(
+        "kind = \"csvr\"\ntemperature_K = 94.4\ntau_ps = 0.5",
+        "kind = \"nose-hoover-chain\"\ntemperature_K = 94.4\ntau_ps = 0.5\nchain_length = 3",
+    );
+    assert!(base.contains("nose-hoover-chain"));
+    let split = assert_restart_is_bitwise("restart-nhc", &spec, &base);
+    let c = ucmd_io::Checkpoint::read(&split.join("out/checkpoint.ucchk")).unwrap();
+    assert_eq!(c.meta.thermostat_state.len(), 6, "ξ₁..ξ₃ and v_ξ₁..v_ξ₃");
+    assert!(c.meta.thermostat_state.iter().any(|x| *x != 0.0));
+    assert!(c.meta.thermostat_rng.is_none());
+}
+
+/// E2.6: Langevin BAOAB restarts bitwise: the random stream travels in the checkpoint.
+#[test]
+fn restart_with_langevin_baoab_is_bitwise_identical() {
+    let Some(spec) = spec() else { return };
+    let base = restart_base(&spec)
+        .replace(
+            "integrator = \"velocity-verlet\"",
+            "integrator = \"langevin-baoab\"",
+        )
+        .replace(
+            "kind = \"csvr\"\ntemperature_K = 94.4\ntau_ps = 0.5",
+            "kind = \"langevin\"\ntemperature_K = 94.4\nfriction_per_ps = 1.0",
+        );
+    assert!(base.contains("langevin-baoab") && base.contains("friction_per_ps"));
+    let split = assert_restart_is_bitwise("restart-langevin", &spec, &base);
+    let c = ucmd_io::Checkpoint::read(&split.join("out/checkpoint.ucchk")).unwrap();
+    assert!(c.meta.thermostat_rng.is_some());
+    assert!(c.meta.thermostat_state.is_empty());
 }
 
 /// `ucmd export` turns a checkpoint into a valid package that carries the checkpoint's state.

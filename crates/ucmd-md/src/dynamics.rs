@@ -178,22 +178,50 @@ impl<P: ForceProvider> Dynamics<P> {
         let next_step = self.state.step + 1;
         self.spare_velocities
             .copy_from_slice(&self.state.velocities);
+        let middle = self
+            .thermostat
+            .as_ref()
+            .is_some_and(|t| t.acts_in_the_middle());
         let mut work = 0.0;
-        if let Some(thermostat) = self.thermostat.as_mut() {
-            work += thermostat.apply(&mut self.spare_velocities, &self.masses, self.dof, 0.5 * dt);
+        if middle {
+            // BAOAB: B(½) A(½) O(1) A(½) F B(½)
+            kick(
+                &mut self.spare_velocities,
+                &self.forces.forces,
+                &self.inverse_masses,
+                0.5 * dt,
+            );
+            drift_into(
+                &mut self.spare_positions,
+                &self.state.positions,
+                &self.spare_velocities,
+                0.5 * dt,
+            );
+            if let Some(thermostat) = self.thermostat.as_mut() {
+                work += thermostat.apply(&mut self.spare_velocities, &self.masses, self.dof, dt);
+            }
+            for (x, v) in self.spare_positions.iter_mut().zip(&self.spare_velocities) {
+                *x += 0.5 * dt * *v;
+            }
+        } else {
+            // O(½) B(½) A(1) F B(½) O(½)
+            if let Some(thermostat) = self.thermostat.as_mut() {
+                work +=
+                    thermostat.apply(&mut self.spare_velocities, &self.masses, self.dof, 0.5 * dt);
+            }
+            kick(
+                &mut self.spare_velocities,
+                &self.forces.forces,
+                &self.inverse_masses,
+                0.5 * dt,
+            );
+            drift_into(
+                &mut self.spare_positions,
+                &self.state.positions,
+                &self.spare_velocities,
+                dt,
+            );
         }
-        kick(
-            &mut self.spare_velocities,
-            &self.forces.forces,
-            &self.inverse_masses,
-            0.5 * dt,
-        );
-        drift_into(
-            &mut self.spare_positions,
-            &self.state.positions,
-            &self.spare_velocities,
-            dt,
-        );
         let request = EvalRequest {
             step: next_step,
             time_ps: self.state.time_ps + dt,
@@ -217,7 +245,7 @@ impl<P: ForceProvider> Dynamics<P> {
             &self.inverse_masses,
             0.5 * dt,
         );
-        if let Some(thermostat) = self.thermostat.as_mut() {
+        if !middle && let Some(thermostat) = self.thermostat.as_mut() {
             work += thermostat.apply(&mut self.spare_velocities, &self.masses, self.dof, 0.5 * dt);
         }
         if self.config.remove_com_every > 0 && next_step % self.config.remove_com_every == 0 {
@@ -353,10 +381,37 @@ impl<P: ForceProvider> Dynamics<P> {
         self.dof
     }
 
-    /// K + U − (work done by the thermostat) in kJ/mol: constant for exact dynamics.
+    /// The conserved quantity in kJ/mol, constant for exact dynamics: K + U + the bath energy
+    /// for extended-system thermostats (Nosé–Hoover chains), otherwise K + U − the work done by
+    /// the thermostat.
     pub fn conserved_energy(&self) -> Option<f64> {
-        self.potential_energy()
-            .map(|u| self.kinetic_energy() + u - self.thermostat_work)
+        let bath = self
+            .thermostat
+            .as_ref()
+            .and_then(|t| t.bath_energy(self.dof));
+        self.potential_energy().map(|u| match bath {
+            Some(b) => self.kinetic_energy() + u + b,
+            None => self.kinetic_energy() + u - self.thermostat_work,
+        })
+    }
+
+    /// The thermostat's internal variables, for checkpoints.
+    pub fn thermostat_state(&self) -> Vec<f64> {
+        self.thermostat
+            .as_ref()
+            .map(|t| t.state())
+            .unwrap_or_default()
+    }
+
+    /// Restore the thermostat's internal variables after a restart.
+    pub fn restore_thermostat_state(&mut self, state: &[f64]) -> Result<(), RunError> {
+        match self.thermostat.as_mut() {
+            Some(t) => t.restore(state).map_err(RunError::Setup),
+            None if state.is_empty() => Ok(()),
+            None => Err(RunError::Setup(
+                "the checkpoint has thermostat state, the run no thermostat".into(),
+            )),
+        }
     }
 
     /// Work done on the system by the thermostat so far (kJ/mol).
@@ -634,6 +689,299 @@ mod tests {
             "{k_rel} {var_rel} {u_rel}"
         );
         assert!(drift / k_mean < 1e-3);
+    }
+
+    /// Argon-mass particles on a ring (a test-only interacting system): each sits in a quartic
+    /// trap ¼b(x⁴ + y⁴ + z⁴) and is tied to its ring neighbours by springs ½k|r_{i+1} − r_i|².
+    /// The quartic traps make it anharmonic and chaotic, so a deterministic thermostat can
+    /// sample it. The trap has no continuous symmetry, so neither momentum nor angular momentum
+    /// is conserved and N_f = 3N. For any confining potential the canonical ensemble has
+    /// ⟨K⟩ = N_f kT/2, Var(K) = N_f (kT)²/2 and ⟨−Σ r·F⟩ = N_f kT (generalized equipartition).
+    struct QuarticRing {
+        b: f64,
+        k: f64,
+    }
+
+    impl ForceProvider for QuarticRing {
+        fn name(&self) -> &str {
+            "quartic-ring"
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                periodic: false,
+                virial: false,
+                energy_terms: false,
+                deterministic: true,
+            }
+        }
+        fn initialize(&mut self, _: &System) -> Result<(), ForceError> {
+            Ok(())
+        }
+        fn evaluate(
+            &mut self,
+            x: &[Vec3],
+            _: Option<&Cell>,
+            _: &EvalRequest,
+            out: &mut ForceResult,
+        ) -> Result<(), ForceError> {
+            let mut energy = 0.0;
+            for (f, r) in out.forces.iter_mut().zip(x) {
+                let r2 = *r * *r;
+                energy += 0.25 * self.b * (r2 * r2).element_sum();
+                *f = -self.b * r2 * *r;
+            }
+            let n = x.len();
+            for i in 0..n {
+                let j = (i + 1) % n;
+                let d = x[j] - x[i];
+                energy += 0.5 * self.k * d.length_squared();
+                out.forces[i] += self.k * d;
+                out.forces[j] -= self.k * d;
+            }
+            out.energy = Some(energy);
+            Ok(())
+        }
+    }
+
+    /// Relative deviations of ⟨K⟩, Var(K) and ⟨−Σ r·F⟩ from their canonical values for 64
+    /// argon-mass particles in a [`QuarticRing`] at 300 K, sampled every 10 steps after 50 ps,
+    /// and the largest change of the conserved quantity relative to ⟨K⟩. The last element is
+    /// the standard error of the Var(K) deviation from 20 blocks.
+    fn quartic_ring_canonical(thermostat: Box<dyn Thermostat>, dt_ps: f64, steps: u64) -> [f64; 5] {
+        use crate::random::{STREAM_VELOCITIES, stream};
+        use crate::velocities::maxwell_boltzmann;
+        use ucmd_core::units::BOLTZMANN_KJMOL_K;
+
+        let (n, t) = (64, 300.0);
+        let system = particles(&vec![39.948; n]);
+        let dof = 3.0 * n as f64;
+        let x0 = (0..n)
+            .map(|i| {
+                let a = std::f64::consts::TAU * i as f64 / n as f64;
+                Vec3::new(0.1 * a.cos(), 0.1 * a.sin(), 0.0)
+            })
+            .collect();
+        let v0 = maxwell_boltzmann(
+            system.masses(),
+            t,
+            dof,
+            false,
+            &mut stream(11, STREAM_VELOCITIES),
+        );
+        let mut md = Dynamics::new(
+            &system,
+            QuarticRing { b: 2.5e4, k: 500.0 },
+            State::new(x0, Some(v0), None),
+            DynamicsConfig::nve(dt_ps),
+            Some(thermostat),
+        )
+        .unwrap();
+        md.run((50.0 / dt_ps) as u64, |_| {}).unwrap();
+        let start = md.conserved_energy().unwrap();
+        let (mut k, mut w) = (Vec::new(), Vec::new());
+        let mut drift = 0.0f64;
+        md.run(steps, |m| {
+            if m.state().step % 10 == 0 {
+                k.push(m.kinetic_energy());
+                w.push(
+                    -m.state()
+                        .positions
+                        .iter()
+                        .zip(&m.forces().forces)
+                        .map(|(r, f)| r.dot(*f))
+                        .sum::<f64>(),
+                );
+                drift = drift.max((m.conserved_energy().unwrap() - start).abs());
+            }
+        })
+        .unwrap();
+        let kt = BOLTZMANN_KJMOL_K * t;
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+        let var_dev = |v: &[f64]| {
+            let m = mean(v);
+            v.iter().map(|x| (x - m) * (x - m)).sum::<f64>()
+                / v.len() as f64
+                / (0.5 * dof * kt * kt)
+                - 1.0
+        };
+        let blocks: Vec<f64> = k.chunks(k.len() / 20).take(20).map(var_dev).collect();
+        let b_mean = mean(&blocks);
+        let b_err = (blocks
+            .iter()
+            .map(|x| (x - b_mean) * (x - b_mean))
+            .sum::<f64>()
+            / (blocks.len() * (blocks.len() - 1)) as f64)
+            .sqrt();
+        let k_mean = mean(&k);
+        [
+            k_mean / (0.5 * dof * kt) - 1.0,
+            var_dev(&k),
+            mean(&w) / (dof * kt) - 1.0,
+            drift / k_mean,
+            b_err,
+        ]
+    }
+
+    /// E2.6: Nosé–Hoover chains (M = 3, τ = 0.1 ps) sample the canonical ensemble of an
+    /// interacting system, and the extended energy is conserved.
+    #[test]
+    fn nose_hoover_chain_samples_the_canonical_ensemble() {
+        use crate::thermostat::NoseHooverChain;
+        let [k_rel, var_rel, w_rel, drift, var_err] = quartic_ring_canonical(
+            Box::new(NoseHooverChain::new(300.0, 0.1, 3)),
+            0.004,
+            250_000,
+        );
+        eprintln!(
+            "NHC: <K> {k_rel:+.4}, Var(K) {var_rel:+.4} (block error {var_err:.4}), <-r.F> {w_rel:+.4} (relative), conserved drift {drift:.2e} of <K>"
+        );
+        assert!(
+            k_rel.abs() < 0.01 && var_rel.abs() < 0.1 && w_rel.abs() < 0.01,
+            "{k_rel} {var_rel} {w_rel}"
+        );
+        assert!(drift < 1e-3, "drift {drift}");
+    }
+
+    /// E2.6: Langevin BAOAB (γ = 2 ps⁻¹) samples the same canonical ensemble.
+    #[test]
+    fn langevin_baoab_samples_the_canonical_ensemble() {
+        use crate::random::{STREAM_THERMOSTAT, stream};
+        use crate::thermostat::Langevin;
+        let [k_rel, var_rel, w_rel, drift, var_err] = quartic_ring_canonical(
+            Box::new(Langevin::new(300.0, 2.0, stream(11, STREAM_THERMOSTAT))),
+            0.004,
+            250_000,
+        );
+        eprintln!(
+            "Langevin BAOAB: <K> {k_rel:+.4}, Var(K) {var_rel:+.4} (block error {var_err:.4}), <-r.F> {w_rel:+.4} (relative), K + U - heat drift {drift:.2e} of <K>"
+        );
+        assert!(
+            k_rel.abs() < 0.01 && var_rel.abs() < 0.1 && w_rel.abs() < 0.01,
+            "{k_rel} {var_rel} {w_rel}"
+        );
+        assert!(drift < 1e-3, "drift {drift}");
+    }
+
+    /// E2.6 validation (slow; run with `cargo test --release -p ucmd-md -- --ignored`): both
+    /// thermostats over 10 ns, where the statistical errors are about three times smaller.
+    #[test]
+    #[ignore]
+    fn thermostats_sample_the_canonical_ensemble_long() {
+        use crate::random::{STREAM_THERMOSTAT, stream};
+        use crate::thermostat::{Langevin, NoseHooverChain};
+        let runs: [(&str, Box<dyn Thermostat>); 2] = [
+            ("NHC", Box::new(NoseHooverChain::new(300.0, 0.1, 3))),
+            (
+                "Langevin BAOAB",
+                Box::new(Langevin::new(300.0, 2.0, stream(12, STREAM_THERMOSTAT))),
+            ),
+        ];
+        for (name, thermostat) in runs {
+            let [k_rel, var_rel, w_rel, drift, var_err] =
+                quartic_ring_canonical(thermostat, 0.004, 2_500_000);
+            eprintln!(
+                "{name} (10 ns): <K> {k_rel:+.4}, Var(K) {var_rel:+.4} (block error {var_err:.4}), <-r.F> {w_rel:+.4}, drift {drift:.2e}"
+            );
+            assert!(
+                k_rel.abs() < 0.005 && var_rel.abs() < 0.05 && w_rel.abs() < 0.005,
+                "{name}: {k_rel} {var_rel} {w_rel}"
+            );
+            assert!(drift < 1e-3, "{name}: drift {drift}");
+        }
+    }
+
+    /// E2.6: for a harmonic oscillator BAOAB samples positions exactly at any stable step,
+    /// ⟨x²⟩ = kT/k, while velocities carry the step error ⟨v²⟩ = (kT/m)(1 − (ωΔt/2)²)
+    /// (Leimkuhler & Matthews 2013). Checked at ωΔt = 1, where the velocity bias is 25 %.
+    #[test]
+    fn baoab_samples_harmonic_positions_exactly() {
+        use crate::random::{STREAM_THERMOSTAT, stream};
+        use crate::thermostat::Langevin;
+        use ucmd_core::units::BOLTZMANN_KJMOL_K;
+
+        let (n, t, k, mass): (usize, f64, f64, f64) = (100, 300.0, 1000.0, 39.948);
+        let omega = (k / mass).sqrt();
+        let dt = 1.0 / omega;
+        let system = particles(&vec![mass; n]);
+        let state = State::new(vec![Vec3::ZERO; n], Some(vec![Vec3::ZERO; n]), None);
+        let thermostat = Box::new(Langevin::new(t, 5.0, stream(3, STREAM_THERMOSTAT)));
+        let mut md = Dynamics::new(
+            &system,
+            Tether(k),
+            state,
+            DynamicsConfig::nve(dt),
+            Some(thermostat),
+        )
+        .unwrap();
+        md.run(1000, |_| {}).unwrap();
+        let (mut x2, mut v2, mut samples) = (0.0, 0.0, 0.0);
+        md.run(20_000, |m| {
+            x2 += m
+                .state()
+                .positions
+                .iter()
+                .map(|r| r.length_squared())
+                .sum::<f64>();
+            v2 += m
+                .state()
+                .velocities
+                .iter()
+                .map(|v| v.length_squared())
+                .sum::<f64>();
+            samples += 3.0 * n as f64;
+        })
+        .unwrap();
+        let kt = BOLTZMANN_KJMOL_K * t;
+        let x_rel = x2 / samples / (kt / k) - 1.0;
+        let v_expected = kt / mass * (1.0 - 0.25 * (omega * dt).powi(2));
+        let v_rel = v2 / samples / v_expected - 1.0;
+        eprintln!("BAOAB at ωΔt = 1: <x²> {x_rel:+.5}, <v²> vs (kT/m)(1 − (ωΔt/2)²) {v_rel:+.5}");
+        assert!(x_rel.abs() < 0.01 && v_rel.abs() < 0.01, "{x_rel} {v_rel}");
+    }
+
+    /// The chain variables survive a state()/restore() round trip, and a wrong length is
+    /// refused. A chain of length 1 (plain Nosé–Hoover) runs.
+    #[test]
+    fn nose_hoover_chain_state_round_trip() {
+        use crate::thermostat::NoseHooverChain;
+        let system = particles(&[39.948; 4]);
+        let x0 = vec![
+            Vec3::new(0.1, 0.0, 0.0),
+            Vec3::new(0.0, 0.1, 0.0),
+            Vec3::new(0.0, 0.0, 0.1),
+            Vec3::new(-0.1, 0.0, 0.0),
+        ];
+        for m in [1, 3] {
+            let mut md = Dynamics::new(
+                &system,
+                QuarticRing { b: 2.5e4, k: 500.0 },
+                State::new(x0.clone(), Some(vec![Vec3::ZERO; 4]), None),
+                DynamicsConfig::nve(0.004),
+                Some(Box::new(NoseHooverChain::new(300.0, 0.1, m))),
+            )
+            .unwrap();
+            md.run(100, |_| {}).unwrap();
+            let saved = md.thermostat_state();
+            assert_eq!(saved.len(), 2 * m);
+            assert!(saved.iter().all(|x| x.is_finite()) && saved.iter().any(|x| *x != 0.0));
+            let mut copy = Dynamics::new(
+                &system,
+                QuarticRing { b: 2.5e4, k: 500.0 },
+                md.state().clone(),
+                DynamicsConfig::nve(0.004),
+                Some(Box::new(NoseHooverChain::new(300.0, 0.1, m))),
+            )
+            .unwrap();
+            copy.restore_thermostat_state(&saved).unwrap();
+            assert_eq!(
+                copy.conserved_energy().map(f64::to_bits),
+                md.conserved_energy().map(f64::to_bits)
+            );
+            md.run(50, |_| {}).unwrap();
+            copy.run(50, |_| {}).unwrap();
+            assert_eq!(md.state(), copy.state());
+            assert!(copy.restore_thermostat_state(&saved[1..]).is_err());
+        }
     }
 
     /// A provider that fails at a given step leaves the last completed state untouched.

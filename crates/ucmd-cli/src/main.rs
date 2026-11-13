@@ -24,7 +24,7 @@ use ucmd_io::{
 use ucmd_md::kinetics::{degrees_of_freedom, remove_angular_momentum, remove_com_velocity};
 use ucmd_md::random::{STREAM_THERMOSTAT, STREAM_VELOCITIES, stream};
 use ucmd_md::velocities::maxwell_boltzmann;
-use ucmd_md::{Csvr, Dynamics, DynamicsConfig, Thermostat};
+use ucmd_md::{Csvr, Dynamics, DynamicsConfig, Langevin, NoseHooverChain, Thermostat};
 
 /// Engine version and git commit, for provenance.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -472,16 +472,48 @@ fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
             };
             Some(Box::new(Csvr::new(*temperature_k, *tau_ps, rng)))
         }
-        Some(other) => bail!("thermostat {other:?} arrives in E2.6; available: csvr"),
+        Some(ThermostatSection::NoseHooverChain {
+            temperature_k,
+            tau_ps,
+            chain_length,
+        }) => Some(Box::new(NoseHooverChain::new(
+            *temperature_k,
+            *tau_ps,
+            chain_length.unwrap_or(3) as usize,
+        ))),
+        Some(ThermostatSection::Langevin {
+            temperature_k,
+            friction_per_ps,
+        }) => {
+            let rng = match checkpoint
+                .as_ref()
+                .and_then(|c| c.meta.thermostat_rng.clone())
+            {
+                Some(saved) => serde_json::from_value::<rand_chacha::ChaCha8Rng>(saved)?,
+                None => stream(s.config.run.seed, STREAM_THERMOSTAT),
+            };
+            Some(Box::new(Langevin::new(
+                *temperature_k,
+                *friction_per_ps,
+                rng,
+            )))
+        }
     };
     if s.config.barostat.is_some() {
         bail!("barostats arrive in E2.7");
     }
     let provider = registry::make_providers(&s.config, &state)?;
+    let remove_com_every = s.config.momentum.as_ref().map_or(0, |m| m.remove_com_every);
+    // The centre-of-mass momentum stays zero under NVE, CSVR and Nosé–Hoover chains, but
+    // Langevin noise thermalizes it unless it is removed (the convention of GROMACS and OpenMM).
+    let langevin = matches!(
+        s.config.thermostat,
+        Some(ThermostatSection::Langevin { .. })
+    );
     let config = DynamicsConfig {
         dt_ps: s.config.run.timestep_fs * PS_PER_FS,
-        remove_com_every: s.config.momentum.as_ref().map_or(0, |m| m.remove_com_every),
-        com_removed: true,
+        remove_com_every,
+        com_removed: !(langevin && remove_com_every == 0),
         energy_every_step: false,
         virial_every_step: false,
     };
@@ -490,6 +522,14 @@ fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
     let start_step = dynamics.state().step;
     if let Some(c) = &checkpoint {
         dynamics.restore_thermostat_work(c.meta.thermostat_work_kjmol);
+        if let Err(e) = dynamics.restore_thermostat_state(&c.meta.thermostat_state) {
+            let file = restart.unwrap_or(Path::new("")).display();
+            if !force {
+                bail!("{file}: {e}");
+            }
+            // --force across a thermostat change, e.g. CSVR equilibration → NHC production
+            eprintln!("warning: {file}: {e}; the thermostat starts from a fresh state (--force)");
+        }
     }
     let mut observers = observers(&s, checkpoint.as_ref().map(|c| c.meta.step))?;
     let steps = s.config.run.steps.saturating_sub(start_step);
@@ -518,6 +558,7 @@ fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
         time_ps: 0.0,
         thermostat_work_kjmol: 0.0,
         thermostat_rng: None,
+        thermostat_state: Vec::new(),
     };
     eprintln!(
         "ucmd {VERSION} ({GIT_HASH}): {} atoms, steps {start_step}..{} of {} fs, N_dof = {}{}\n  hardware: {}",
