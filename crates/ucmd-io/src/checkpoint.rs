@@ -43,6 +43,31 @@ pub struct CheckpointMeta {
     pub thermostat_state: Vec<f64>,
 }
 
+/// One restart of a run, for the trajectory's provenance (`/parameters/ucmd/restarts`).
+///
+/// spec/checkpoint.md asks that a forced restart (`--force` over a changed package or run
+/// configuration) is recorded; every restart is recorded, so that a change of machine or engine
+/// version is traceable too.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RestartRecord {
+    /// The checkpoint step the run continues from.
+    pub step: u64,
+    /// Its time in ps.
+    pub time_ps: f64,
+    /// True if `--force` overrode a mismatch.
+    pub forced: bool,
+    /// What differs from the checkpoint, e.g. "run configuration: 1a2b… → 3c4d…".
+    pub differences: Vec<String>,
+    /// Engine version of the restarted run.
+    pub engine_version: String,
+    /// Engine git commit of the restarted run.
+    pub engine_git_hash: String,
+    /// Backend, thread count and CPU model of the restarted run (ADR 0010).
+    pub hardware: String,
+    /// The fully resolved run configuration of the restarted run.
+    pub run_config_toml: String,
+}
+
 /// A checkpoint: metadata and state arrays.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Checkpoint {

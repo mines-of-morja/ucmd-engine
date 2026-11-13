@@ -24,14 +24,14 @@ pub mod package;
 pub mod thermo;
 pub mod xyz;
 
-pub use checkpoint::{Checkpoint, CheckpointError, CheckpointMeta};
+pub use checkpoint::{Checkpoint, CheckpointError, CheckpointMeta, RestartRecord};
 pub use config::{
     FileOutput, Integrator, MachineProfile, MomentumSection, OutputSection, RunConfig,
     ThermostatSection, TrajectoryOutput, VelocitiesSection, load_run_config,
 };
 pub use error::{ErrorCode, SpecError};
 #[cfg(feature = "h5md")]
-pub use h5md::{H5mdFrame, H5mdOptions, H5mdProvenance, H5mdReader, H5mdWriter};
+pub use h5md::{H5mdFrame, H5mdOptions, H5mdProvenance, H5mdReader, H5mdWriter, read_restarts};
 pub use package::{Package, read_package};
 pub use thermo::ThermoWriter;
 pub use xyz::XyzWriter;

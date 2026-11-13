@@ -41,6 +41,8 @@ $ucmd run run.toml                           # run; outputs in [output] of run.t
 $ucmd run run.toml --restart out/checkpoint.ucchk   # continue bitwise identically
 # Ctrl-C or SIGTERM stops a run gracefully: the step completes, the checkpoint is written, the
 # outputs are closed, and the exit status is 130 or 143. A second Ctrl-C ends it at once.
+# Every restart is recorded in the H5MD trajectory under /parameters/ucmd/restarts/NNN (step,
+# time, engine, hardware, the run configuration; with --force also the overridden differences).
 $ucmd export run.toml --checkpoint out/checkpoint.ucchk --out equilibrated.ucsys
 $ucmd rerun run.toml --trajectory out/trajectory.h5 --out energies.tsv
 ```

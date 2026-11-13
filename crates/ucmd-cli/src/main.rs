@@ -370,7 +370,11 @@ fn initial_state(s: &Setup, dof: f64) -> State {
     state
 }
 
-fn observers(s: &Setup, restart_step: Option<u64>) -> Result<Vec<Box<dyn Observer>>> {
+fn observers(
+    s: &Setup,
+    restart: Option<&ucmd_io::RestartRecord>,
+) -> Result<Vec<Box<dyn Observer>>> {
+    let restart_step = restart.map(|r| r.step);
     let mut list: Vec<Box<dyn Observer>> = Vec::new();
     let Some(output) = &s.config.output else {
         return Ok(list);
@@ -399,7 +403,7 @@ fn observers(s: &Setup, restart_step: Option<u64>) -> Result<Vec<Box<dyn Observe
                 None => ucmd_io::XyzWriter::create(&path, trajectory.every, elements).map_err(e)?,
             }));
         } else {
-            list.push(h5md_writer(s, &path, trajectory, restart_step)?);
+            list.push(h5md_writer(s, &path, trajectory, restart)?);
         }
     }
     Ok(list)
@@ -410,7 +414,7 @@ fn h5md_writer(
     s: &Setup,
     path: &Path,
     t: &ucmd_io::TrajectoryOutput,
-    restart_step: Option<u64>,
+    restart: Option<&ucmd_io::RestartRecord>,
 ) -> Result<Box<dyn Observer>> {
     let options = ucmd_io::H5mdOptions {
         every: t.every,
@@ -418,8 +422,8 @@ fn h5md_writer(
         forces: t.forces,
         float32: t.precision.as_deref() == Some("float32"),
     };
-    let writer = match restart_step {
-        Some(step) => ucmd_io::H5mdWriter::open_append(path, &s.package.system, options, step),
+    let writer = match restart {
+        Some(record) => ucmd_io::H5mdWriter::open_append(path, &s.package.system, options, record),
         None => {
             let provenance = ucmd_io::H5mdProvenance {
                 engine_version: VERSION.into(),
@@ -446,7 +450,7 @@ fn h5md_writer(
     _: &Setup,
     path: &Path,
     _: &ucmd_io::TrajectoryOutput,
-    _: Option<u64>,
+    _: Option<&ucmd_io::RestartRecord>,
 ) -> Result<Box<dyn Observer>> {
     bail!(
         "{}: this build has no H5MD support (feature \"h5md\"); use a .xyz trajectory",
@@ -462,10 +466,24 @@ fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
         .transpose()
         .map_err(|e| anyhow!("{e}"))?;
     let fingerprint = s.config.fingerprint();
+    let mut differences = Vec::new();
     if let Some(c) = &checkpoint {
-        let same =
-            c.meta.system_sha256 == system.system_sha256 && c.meta.run_config_sha256 == fingerprint;
-        if !same && !force {
+        let short = |hash: &str| hash.chars().take(12).collect::<String>();
+        if c.meta.system_sha256 != system.system_sha256 {
+            differences.push(format!(
+                "system.json: {} -> {}",
+                short(&c.meta.system_sha256),
+                short(&system.system_sha256)
+            ));
+        }
+        if c.meta.run_config_sha256 != fingerprint {
+            differences.push(format!(
+                "run configuration: {} -> {}",
+                short(&c.meta.run_config_sha256),
+                short(&fingerprint)
+            ));
+        }
+        if !differences.is_empty() && !force {
             bail!(
                 "E_RESTART_MISMATCH  the package or run configuration differ from the checkpoint's (use --force to override)"
             );
@@ -556,7 +574,18 @@ fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
             eprintln!("warning: {file}: {e}; the thermostat starts from a fresh state (--force)");
         }
     }
-    let mut observers = observers(&s, checkpoint.as_ref().map(|c| c.meta.step))?;
+    // every restart goes into the trajectory's provenance; a forced one with its differences
+    let restart = checkpoint.as_ref().map(|c| ucmd_io::RestartRecord {
+        step: c.meta.step,
+        time_ps: c.meta.time_ps,
+        forced: !differences.is_empty(),
+        differences: differences.clone(),
+        engine_version: VERSION.into(),
+        engine_git_hash: GIT_HASH.into(),
+        hardware: hardware::describe(s.threads),
+        run_config_toml: s.config.resolved_toml(),
+    });
+    let mut observers = observers(&s, restart.as_ref())?;
     let steps = s.config.run.steps.saturating_sub(start_step);
     let out_dir = s.config.output_dir();
     std::fs::create_dir_all(&out_dir)?;

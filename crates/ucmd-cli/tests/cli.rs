@@ -309,6 +309,39 @@ fn restart_is_bitwise_identical() {
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("E_RESTART_MISMATCH"));
 
+    // provenance: the first restart is recorded; with --force the run continues and the
+    // override is recorded with its difference (spec/checkpoint.md)
+    #[cfg(feature = "h5md")]
+    {
+        let trajectory = split.join("out/trajectory.h5");
+        let full = split.with_file_name("restart-full");
+        assert!(
+            ucmd_io::read_restarts(&full.join("out/trajectory.h5"))
+                .unwrap()
+                .is_empty()
+        );
+        let first = ucmd_io::read_restarts(&trajectory).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!((first[0].step, first[0].forced), (100, false));
+        assert!(first[0].differences.is_empty());
+        assert!(first[0].run_config_toml.contains("tau_ps = 0.5"));
+        let forced = ucmd()
+            .arg("run")
+            .arg(split.join("run.toml"))
+            .arg("--restart")
+            .arg(split.join("out/checkpoint.ucchk"))
+            .arg("--force")
+            .status()
+            .unwrap();
+        assert!(forced.success());
+        let both = ucmd_io::read_restarts(&trajectory).unwrap();
+        assert_eq!(both.len(), 2);
+        assert_eq!((both[1].step, both[1].forced), (200, true));
+        assert_eq!(both[1].differences.len(), 1);
+        assert!(both[1].differences[0].starts_with("run configuration: "));
+        assert!(both[1].run_config_toml.contains("tau_ps = 0.6"));
+    }
+
     let validator = spec.join("validator/.venv/bin/ucmd-spec");
     if validator.is_file() {
         let output = Command::new(validator)
