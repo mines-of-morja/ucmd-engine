@@ -361,6 +361,80 @@ fn restart_with_langevin_baoab_is_bitwise_identical() {
     assert!(c.meta.thermostat_state.is_empty());
 }
 
+/// B2a: SIGTERM stops a run gracefully. The current step completes, the checkpoint is written,
+/// the trajectory is closed and still valid, and the exit status is 128 + 15. The run then
+/// continues from that checkpoint.
+#[cfg(unix)]
+#[test]
+fn sigterm_stops_a_run_gracefully() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let Some(spec) = spec() else { return };
+    let base = restart_base(&spec);
+    let dir = run_dir(
+        "sigterm",
+        &spec,
+        "argon-864",
+        &base.replace("steps = 25000", "steps = 1000000"),
+    );
+    let child = ucmd()
+        .arg("run")
+        .arg(dir.join("run.toml"))
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let thermo = dir.join("out/thermo.tsv");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while std::fs::read_to_string(&thermo).map_or(0, |t| t.lines().count()) < 5 {
+        assert!(Instant::now() < deadline, "the run made no progress");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let kill = Command::new("kill")
+        .arg("-TERM")
+        .arg(child.id().to_string())
+        .status()
+        .unwrap();
+    assert!(kill.success());
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(143), "{stderr}");
+    assert!(stderr.contains("stopped by SIGTERM"), "{stderr}");
+    let stopped = ucmd_io::Checkpoint::read(&dir.join("out/checkpoint.ucchk")).unwrap();
+    assert!(stopped.meta.step > 0 && stopped.meta.step < 1_000_000);
+
+    let validator = spec.join("validator/.venv/bin/ucmd-spec");
+    if validator.is_file() {
+        let check = Command::new(validator)
+            .arg("validate-trajectory")
+            .arg(dir.join("out/trajectory.h5"))
+            .output()
+            .unwrap();
+        assert!(
+            check.status.success(),
+            "{}",
+            String::from_utf8_lossy(&check.stdout)
+        );
+    }
+    std::fs::write(
+        dir.join("run.toml"),
+        base.replace(
+            "steps = 25000",
+            &format!("steps = {}", stopped.meta.step + 20),
+        ),
+    )
+    .unwrap();
+    let resumed = ucmd()
+        .arg("run")
+        .arg(dir.join("run.toml"))
+        .arg("--restart")
+        .arg(dir.join("out/checkpoint.ucchk"))
+        .status()
+        .unwrap();
+    assert!(resumed.success());
+    let end = ucmd_io::Checkpoint::read(&dir.join("out/checkpoint.ucchk")).unwrap();
+    assert_eq!(end.meta.step, stopped.meta.step + 20);
+}
+
 /// `ucmd export` turns a checkpoint into a valid package that carries the checkpoint's state.
 #[test]
 fn export_writes_a_valid_package_with_velocities() {

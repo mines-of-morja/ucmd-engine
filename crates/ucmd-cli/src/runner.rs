@@ -39,9 +39,24 @@ pub fn checkpoint_of<P: ForceProvider>(
     })
 }
 
+/// How a run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Every requested step was done.
+    Completed,
+    /// `stop` asked to end early; the state after `step` is in the checkpoint at `path`.
+    Stopped {
+        /// The last completed step.
+        step: u64,
+    },
+}
+
 /// Run `steps` more steps. With `observe_start` the current state is recorded first. A
 /// checkpoint is written at every multiple of `plan.every` and at the end. If the provider
 /// fails, the last completed state is written to `emergency` before the error is returned.
+/// `stop` is asked after every step; when it says yes, the current state is written to the
+/// checkpoint file (or to `emergency` without one) and the run ends with [`Outcome::Stopped`].
+#[allow(clippy::too_many_arguments)]
 pub fn drive<P: ForceProvider>(
     dynamics: &mut Dynamics<P>,
     steps: u64,
@@ -50,7 +65,8 @@ pub fn drive<P: ForceProvider>(
     plan: Option<&CheckpointPlan>,
     emergency: &Path,
     base: &CheckpointMeta,
-) -> Result<()> {
+    stop: &dyn Fn() -> bool,
+) -> Result<Outcome> {
     let end = dynamics.state().step + steps;
     let fail = |dynamics: &Dynamics<P>, error: RunError| -> anyhow::Error {
         if matches!(error, RunError::Provider { .. }) {
@@ -75,10 +91,17 @@ pub fn drive<P: ForceProvider>(
             .map_err(|e| fail(dynamics, e))?;
     }
     while dynamics.state().step < end {
-        let step = dynamics.state().step;
-        let segment = plan.map_or(end - step, |p| (p.every - step % p.every).min(end - step));
+        if stop() {
+            let path = plan.map_or(emergency, |p| p.path.as_path());
+            checkpoint_of(dynamics, base)?
+                .write(path)
+                .map_err(|e| anyhow!("{e}"))?;
+            return Ok(Outcome::Stopped {
+                step: dynamics.state().step,
+            });
+        }
         dynamics
-            .run_observed(segment, observers, false)
+            .run_observed(1, observers, false)
             .map_err(|e| fail(dynamics, e))?;
         if let Some(plan) = plan {
             let now = dynamics.state().step;
@@ -89,7 +112,7 @@ pub fn drive<P: ForceProvider>(
             }
         }
     }
-    Ok(())
+    Ok(Outcome::Completed)
 }
 
 #[cfg(test)]
@@ -191,6 +214,7 @@ mod tests {
             Some(&plan),
             &emergency,
             &base(),
+            &|| false,
         )
         .unwrap_err();
         assert!(
@@ -201,6 +225,64 @@ mod tests {
         assert_eq!(saved.meta.step, 6);
         assert_eq!(&saved.state, dynamics.state());
         assert_eq!(Checkpoint::read(&plan.path).unwrap().meta.step, 5); // the regular checkpoint
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A stop request ends the run after the current step and saves that state to the
+    /// checkpoint file (B2a: graceful stop on SIGINT/SIGTERM).
+    #[test]
+    fn a_stop_request_saves_the_current_state() {
+        let mtype = MoleculeType {
+            name: "p".into(),
+            formal_charge_e: 0,
+            atoms: vec![AtomTemplate {
+                name: "P".into(),
+                element: 0,
+                mass_amu: 1.0,
+                charge_e: None,
+                atom_type: None,
+            }],
+            bonds: vec![],
+            angles: vec![],
+            dihedrals: vec![],
+            impropers: vec![],
+            constraints: vec![],
+        };
+        let system = System::new("t", vec![mtype], &[(0, 2)], None, [false; 3]).unwrap();
+        let state = State::new(vec![Vec3::X * 0.1, Vec3::Y * 0.1], None, None);
+        let mut dynamics = Dynamics::new(
+            &system,
+            FailAt(u64::MAX),
+            state,
+            DynamicsConfig::nve(0.001),
+            None,
+        )
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("ucmd-stop-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plan = CheckpointPlan {
+            path: dir.join("checkpoint.ucchk"),
+            every: 5,
+        };
+        let asked = std::cell::Cell::new(0u64);
+        let outcome = drive(
+            &mut dynamics,
+            20,
+            &mut [],
+            true,
+            Some(&plan),
+            &dir.join("emergency.ucchk"),
+            &base(),
+            &|| {
+                asked.set(asked.get() + 1);
+                asked.get() > 7 // stop before the eighth step
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, Outcome::Stopped { step: 7 });
+        let saved = Checkpoint::read(&plan.path).unwrap();
+        assert_eq!(saved.meta.step, 7);
+        assert_eq!(&saved.state, dynamics.state());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

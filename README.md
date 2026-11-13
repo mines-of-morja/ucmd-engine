@@ -39,6 +39,8 @@ $ucmd singlepoint run.toml [--forces f.npy]  # energy, terms, virial of the init
 $ucmd minimize run.toml --out minimized.ucsys  # FIRE until max |F| < 100 kJ/mol/nm (--max-force)
 $ucmd run run.toml                           # run; outputs in [output] of run.toml
 $ucmd run run.toml --restart out/checkpoint.ucchk   # continue bitwise identically
+# Ctrl-C or SIGTERM stops a run gracefully: the step completes, the checkpoint is written, the
+# outputs are closed, and the exit status is 130 or 143. A second Ctrl-C ends it at once.
 $ucmd export run.toml --checkpoint out/checkpoint.ucchk --out equilibrated.ucsys
 $ucmd rerun run.toml --trajectory out/trajectory.h5 --out energies.tsv
 ```

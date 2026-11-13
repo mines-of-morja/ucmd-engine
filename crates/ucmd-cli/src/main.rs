@@ -12,8 +12,11 @@ mod runner;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
+use signal_hook::consts::{SIGINT, SIGTERM};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 use ucmd_core::State;
 use ucmd_core::units::{BAR_PER_KJMOL_NM3, PS_PER_FS};
@@ -133,12 +136,30 @@ fn main() -> ExitCode {
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("error: {e:#}");
-            ExitCode::FAILURE
-        }
+        // the shell convention for a process ended by a signal: 128 + its number
+        Err(e) => match e.downcast_ref::<Stopped>() {
+            Some(stop) => ExitCode::from(u8::try_from(128 + stop.signal).unwrap_or(1)),
+            None => {
+                eprintln!("error: {e:#}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }
+
+/// A run that ended early on request; carries the signal number for the exit status.
+#[derive(Debug)]
+struct Stopped {
+    signal: usize,
+}
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "stopped by signal {}", self.signal)
+    }
+}
+
+impl std::error::Error for Stopped {}
 
 fn spec(e: SpecError) -> anyhow::Error {
     anyhow!("{e}")
@@ -577,6 +598,15 @@ fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
         },
         hardware::describe(s.threads)
     );
+    // A first SIGINT or SIGTERM asks for a graceful stop: finish the step, write the checkpoint,
+    // close the outputs. A second one ends the process at once.
+    let stop = Arc::new(AtomicBool::new(false));
+    let signal = Arc::new(AtomicUsize::new(0));
+    for sig in [SIGINT, SIGTERM] {
+        signal_hook::flag::register_conditional_shutdown(sig, 128 + sig, Arc::clone(&stop))?;
+        signal_hook::flag::register(sig, Arc::clone(&stop))?;
+        signal_hook::flag::register_usize(sig, Arc::clone(&signal), sig as usize)?;
+    }
     let started = Instant::now();
     let outcome = runner::drive(
         &mut dynamics,
@@ -586,11 +616,25 @@ fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
         plan.as_ref(),
         &emergency,
         &base,
+        &|| stop.load(Ordering::Relaxed),
     );
     for observer in &mut observers {
         observer.finish().map_err(|e| anyhow!("{e}"))?;
     }
-    outcome?;
+    if let runner::Outcome::Stopped { step } = outcome? {
+        let sig = signal.load(Ordering::Relaxed);
+        let path = plan.as_ref().map_or(&emergency, |p| &p.path);
+        eprintln!(
+            "stopped by {} after step {step}; the state is in {} (continue with --restart)",
+            if sig == SIGINT as usize {
+                "SIGINT"
+            } else {
+                "SIGTERM"
+            },
+            path.display()
+        );
+        return Err(Stopped { signal: sig }.into());
+    }
     let seconds = started.elapsed().as_secs_f64();
     let ns = steps as f64 * s.config.run.timestep_fs * 1e-6;
     eprintln!(

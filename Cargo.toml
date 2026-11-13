@@ -36,6 +36,8 @@ rustfft = "6.4"
 # Deterministic multithreading (E2 design §9): fixed chunks, fixed-order reductions (ADR 0010)
 rayon = "1.12"
 clap = { version = "4", features = ["derive"] }
+# Graceful stop of `ucmd run` on SIGINT/SIGTERM (B2a design, question 4)
+signal-hook = "0.4"
 anyhow = "1"
 proptest = "1"
 # H5MD trajectories (ADR 0004): bundled static HDF5, no system installation needed
