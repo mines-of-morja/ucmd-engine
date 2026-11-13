@@ -21,6 +21,7 @@ rand_chacha.workspace = true
 toml.workspace = true
 serde_json.workspace = true
 
+rayon.workspace = true
 [lints]
 workspace = true
 
@@ -32,3 +33,6 @@ path = "src/main.rs"
 default = ["h5md"]
 h5md = ["ucmd-io/h5md"]
 
+
+[dev-dependencies]
+sha2.workspace = true

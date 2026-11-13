@@ -1,0 +1,46 @@
+# Electrolyte example, step 2 to watch: the run of run.toml with an XYZ trajectory (every 20 fs)
+# that viewers such as `ase gui` can open while the run is going. Outputs go to out-watch/.
+# Run:   ucmd run watch.toml   (umbrella docs/testing.md §8 shows how to watch it)
+spec_version = "0.1.0"
+system = "minimized.ucsys"
+title = "Electrolyte example: 2 ps NVT to watch"
+
+[run]
+integrator = "velocity-verlet"
+timestep_fs = 1.0
+steps = 2000
+seed = 7
+
+[velocities]
+generate = "maxwell-boltzmann"
+temperature_K = 298.15
+
+[momentum]
+remove_com_every = 100
+
+[thermostat]
+kind = "nose-hoover-chain"
+temperature_K = 298.15
+tau_ps = 0.1
+chain_length = 3
+
+[[providers]]
+kind = "force-field"
+cutoff_nm = 1.4
+coulomb = "pme"
+ewald_tolerance = 1e-5
+
+[output]
+directory = "out-watch"
+
+[output.thermo]
+file = "thermo.tsv"
+every = 10
+
+[output.trajectory]
+file = "trajectory.xyz"
+every = 20
+
+[output.checkpoint]
+file = "checkpoint.ucchk"
+every = 500

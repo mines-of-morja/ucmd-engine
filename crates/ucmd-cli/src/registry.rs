@@ -5,10 +5,19 @@ use anyhow::{Context, Result, bail};
 use ucmd_core::{State, Vec3};
 use ucmd_force::{Composite, ForceProvider};
 use ucmd_io::RunConfig;
-use ucmd_providers_classical::{HarmonicTether, LennardJones, LennardJonesConfig};
+use ucmd_providers_classical::{
+    Bonded, ForceField, HarmonicTether, LennardJones, LennardJonesConfig, Nonbonded,
+    NonbondedConfig,
+};
 
 /// The provider kinds this build knows.
-pub const KINDS: [&str; 2] = ["harmonic-tether", "lennard-jones"];
+pub const KINDS: [&str; 5] = [
+    "bonded",
+    "force-field",
+    "harmonic-tether",
+    "lennard-jones",
+    "nonbonded",
+];
 
 /// Build one provider from its `[[providers]]` table.
 pub fn make_provider(table: &toml::Table, initial: &State) -> Result<Box<dyn ForceProvider>> {
@@ -21,6 +30,22 @@ pub fn make_provider(table: &toml::Table, initial: &State) -> Result<Box<dyn For
     keys.remove("name");
     let value = toml::Value::Table(keys);
     match kind {
+        "force-field" | "nonbonded" => {
+            let config: NonbondedConfig = value
+                .try_into()
+                .with_context(|| format!("[[providers]] kind = \"{kind}\""))?;
+            Ok(if kind == "force-field" {
+                Box::new(ForceField::new(kind, config))
+            } else {
+                Box::new(Nonbonded::new(kind, config))
+            })
+        }
+        "bonded" => {
+            if value.as_table().is_some_and(|t| !t.is_empty()) {
+                bail!("[[providers]] kind = \"bonded\" takes no keys besides kind and name");
+            }
+            Ok(Box::new(Bonded::new(kind)))
+        }
         "lennard-jones" => {
             let config: LennardJonesConfig = value
                 .try_into()

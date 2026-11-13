@@ -25,7 +25,8 @@ pub struct Snapshot<'a> {
     pub kinetic_energy: f64,
     /// Kinetic temperature in K.
     pub temperature_k: f64,
-    /// K + U − thermostat work in kJ/mol, if the energy is known.
+    /// The conserved quantity in kJ/mol, if the energy is known: K + U plus the bath energy
+    /// of an extended-system thermostat, otherwise K + U − the work done by the thermostat.
     pub conserved_energy: Option<f64>,
     /// Pressure tensor in bar, if a virial and a cell are available.
     pub pressure_bar: Option<Mat3>,

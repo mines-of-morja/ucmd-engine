@@ -1,0 +1,47 @@
+# Electrolyte example, step 2: 2 ps NVT of the minimized box with Nosé–Hoover chains.
+# Settings follow Lehnert et al. 2025, SI S1.1 (as validation/m2a/nvt.toml, shorter).
+# Run:   ucmd run run.toml        Outputs go to out/ next to this file.
+spec_version = "0.1.0"
+system = "minimized.ucsys"
+title = "Electrolyte example: 2 ps NVT of 1 M LiPF6 in EC:EMC 3:7"
+
+[run]
+integrator = "velocity-verlet"
+timestep_fs = 1.0
+steps = 2000
+seed = 7
+
+[velocities]
+generate = "maxwell-boltzmann"
+temperature_K = 298.15
+
+[momentum]
+remove_com_every = 100
+
+[thermostat]
+kind = "nose-hoover-chain"
+temperature_K = 298.15
+tau_ps = 0.1
+chain_length = 3
+
+[[providers]]
+kind = "force-field"
+cutoff_nm = 1.4
+coulomb = "pme"
+ewald_tolerance = 1e-5
+
+[output]
+directory = "out"
+
+[output.thermo]
+file = "thermo.tsv"
+every = 10
+
+[output.trajectory]
+file = "trajectory.h5"
+every = 100
+precision = "float32"
+
+[output.checkpoint]
+file = "checkpoint.ucchk"
+every = 500

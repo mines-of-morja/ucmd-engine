@@ -13,9 +13,10 @@
 
 pub mod dynamics;
 pub mod kinetics;
+pub mod minimize;
 pub mod random;
 pub mod thermostat;
 pub mod velocities;
 
 pub use dynamics::{Dynamics, DynamicsConfig, RunError, drift_into, kick};
-pub use thermostat::{Csvr, Thermostat};
+pub use thermostat::{Csvr, Langevin, NoseHooverChain, Thermostat};

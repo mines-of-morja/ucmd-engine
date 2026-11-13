@@ -3,11 +3,12 @@
 //! This is the only crate that knows the concrete force providers ([`registry`]). It wires
 //! package, run configuration, machine profile, providers, dynamics and writers together.
 
+mod hardware;
 mod registry;
-mod runner;
 
 // The i-PI providers are registered in E3.1; the dependency already exists for the crate graph.
 use ucmd_providers_ipi as _;
+mod runner;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
@@ -23,7 +24,7 @@ use ucmd_io::{
 use ucmd_md::kinetics::{degrees_of_freedom, remove_angular_momentum, remove_com_velocity};
 use ucmd_md::random::{STREAM_THERMOSTAT, STREAM_VELOCITIES, stream};
 use ucmd_md::velocities::maxwell_boltzmann;
-use ucmd_md::{Csvr, Dynamics, DynamicsConfig, Thermostat};
+use ucmd_md::{Csvr, Dynamics, DynamicsConfig, Langevin, NoseHooverChain, Thermostat};
 
 /// Engine version and git commit, for provenance.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -78,6 +79,21 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Relax the package's positions with FIRE (E2.0) and write them as a new package, e.g. after
+    /// packing. Uses the package and providers of run.toml; writes nothing unless it converges.
+    Minimize {
+        /// The run configuration (package and providers).
+        run_toml: PathBuf,
+        /// Directory of the new package (created; must not exist).
+        #[arg(long)]
+        out: PathBuf,
+        /// Convergence: largest atomic force in kJ mol⁻¹ nm⁻¹.
+        #[arg(long, default_value_t = 100.0)]
+        max_force: f64,
+        /// Give up after this many steps.
+        #[arg(long, default_value_t = 10_000)]
+        max_steps: u64,
+    },
     /// Evaluate the providers once on the initial state and print energies as JSON.
     Singlepoint {
         /// The run configuration.
@@ -98,6 +114,12 @@ fn main() -> ExitCode {
             force,
         } => run(&run_toml, restart.as_deref(), force),
         Command::Singlepoint { run_toml, forces } => singlepoint(&run_toml, forces.as_deref()),
+        Command::Minimize {
+            run_toml,
+            out,
+            max_force,
+            max_steps,
+        } => minimize(&run_toml, &out, max_force, max_steps),
         Command::Export {
             run_toml,
             checkpoint,
@@ -155,11 +177,14 @@ struct Setup {
     #[cfg_attr(not(feature = "h5md"), allow(dead_code))] // only the H5MD writer reads it so far
     machine: MachineProfile,
     system_json: String,
+    /// Worker threads in use (machine profile; provenance only).
+    threads: usize,
 }
 
 fn setup(run_toml: &Path) -> Result<Setup> {
     let config = load_run_config(run_toml).map_err(spec)?;
     let machine = MachineProfile::load().map_err(spec)?;
+    let threads = hardware::start_threads(machine.threads)?;
     let package = read_package(&config.system_dir()).map_err(spec)?;
     for (code, message) in &package.warnings {
         eprintln!("warning: {code}  {message}");
@@ -171,6 +196,7 @@ fn setup(run_toml: &Path) -> Result<Setup> {
         package,
         machine,
         system_json,
+        threads,
     })
 }
 
@@ -219,6 +245,89 @@ fn singlepoint(run_toml: &Path, forces_out: Option<&Path>) -> Result<()> {
 }
 
 /// Initial velocities and momentum handling of spec/run-config.md (`[velocities]`, `[momentum]`).
+fn minimize(run_toml: &Path, out: &Path, max_force: f64, max_steps: u64) -> Result<()> {
+    if out.exists() {
+        bail!("{} exists; choose a new directory", out.display());
+    }
+    let s = setup(run_toml)?;
+    let state = &s.package.state;
+    let mut provider = Guarded::new(registry::make_providers(&s.config, state)?);
+    provider
+        .initialize(&s.package.system)
+        .map_err(|e| anyhow!("{e}"))?;
+    let config = ucmd_md::minimize::FireConfig {
+        max_force_kjmol_nm: max_force,
+        max_steps,
+        ..ucmd_md::minimize::FireConfig::default()
+    };
+    let mut positions = state.positions.clone();
+    eprintln!(
+        "ucmd {VERSION} ({GIT_HASH}) minimize: {} atoms, FIRE until max |F| < {max_force} kJ/mol/nm\n  hardware: {}",
+        s.package.system.n_atoms(),
+        hardware::describe(s.threads)
+    );
+    let started = Instant::now();
+    let report = ucmd_md::minimize::minimize(
+        &mut provider,
+        s.package.system.masses(),
+        &mut positions,
+        state.cell.as_ref(),
+        &config,
+        |step, energy, force| {
+            if step % 100 == 0 {
+                eprintln!(
+                    "  step {step:>6}  E = {energy:.4} kJ/mol  max |F| = {force:.2} kJ/mol/nm"
+                );
+            }
+        },
+    )
+    .map_err(|e| anyhow!("minimization failed: {e}"))?;
+    eprintln!(
+        "{}: {} steps in {:.1} s, E {:.4} → {:.4} kJ/mol, max |F| {:.1} → {:.2} kJ/mol/nm",
+        report.reason,
+        report.steps,
+        started.elapsed().as_secs_f64(),
+        report.energy_start_kjmol,
+        report.energy_kjmol,
+        report.max_force_start_kjmol_nm,
+        report.max_force_kjmol_nm
+    );
+    if !report.converged {
+        bail!(
+            "not converged ({}); nothing written. Raise --max-steps or --max-force, or check the system",
+            report.reason
+        );
+    }
+    let mut doc: serde_json::Value = serde_json::from_str(&s.system_json)?;
+    let original = doc["provenance"].take();
+    doc["provenance"] = serde_json::json!({
+        "created_by": format!("ucmd {VERSION} ({GIT_HASH}) minimize"),
+        "created_utc": utc_now(),
+        "notes": format!("FIRE 2.0 minimization of the package of {}", run_toml.display()),
+        "minimization": {
+            "method": "FIRE 2.0 (Guénolé et al. 2020), semi-implicit Euler",
+            "steps": report.steps,
+            "max_force_criterion_kjmol_nm": max_force,
+            "energy_start_kjmol": report.energy_start_kjmol,
+            "energy_kjmol": report.energy_kjmol,
+            "max_force_start_kjmol_nm": report.max_force_start_kjmol_nm,
+            "max_force_kjmol_nm": report.max_force_kjmol_nm,
+            "run_config_toml": s.config.resolved_toml(),
+        },
+        "hardware": hardware::describe(s.threads),
+        "derived_from": original,
+    });
+    std::fs::create_dir_all(out)?;
+    std::fs::write(
+        out.join("system.json"),
+        serde_json::to_string_pretty(&doc)? + "\n",
+    )?;
+    ucmd_io::npy::write_vec3_array(&out.join("positions.npy"), &positions)?;
+    read_package(out).map_err(|e| anyhow!("the minimized package is invalid: {e}"))?;
+    eprintln!("wrote {}", out.display());
+    Ok(())
+}
+
 fn initial_state(s: &Setup, dof: f64) -> State {
     let mut state = s.package.state.clone();
     let masses = s.package.system.masses();
@@ -302,6 +411,7 @@ fn h5md_writer(
                 system_json: s.system_json.clone(),
                 run_config_toml: s.config.resolved_toml(),
                 system_sha256: s.package.system.system_sha256.clone(),
+                hardware: hardware::describe(s.threads),
             };
             ucmd_io::H5mdWriter::create(path, &s.package.system, options, &provenance)
         }
@@ -366,16 +476,48 @@ fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
             };
             Some(Box::new(Csvr::new(*temperature_k, *tau_ps, rng)))
         }
-        Some(other) => bail!("thermostat {other:?} arrives in E2.6; available: csvr"),
+        Some(ThermostatSection::NoseHooverChain {
+            temperature_k,
+            tau_ps,
+            chain_length,
+        }) => Some(Box::new(NoseHooverChain::new(
+            *temperature_k,
+            *tau_ps,
+            chain_length.unwrap_or(3) as usize,
+        ))),
+        Some(ThermostatSection::Langevin {
+            temperature_k,
+            friction_per_ps,
+        }) => {
+            let rng = match checkpoint
+                .as_ref()
+                .and_then(|c| c.meta.thermostat_rng.clone())
+            {
+                Some(saved) => serde_json::from_value::<rand_chacha::ChaCha8Rng>(saved)?,
+                None => stream(s.config.run.seed, STREAM_THERMOSTAT),
+            };
+            Some(Box::new(Langevin::new(
+                *temperature_k,
+                *friction_per_ps,
+                rng,
+            )))
+        }
     };
     if s.config.barostat.is_some() {
         bail!("barostats arrive in E2.7");
     }
     let provider = registry::make_providers(&s.config, &state)?;
+    let remove_com_every = s.config.momentum.as_ref().map_or(0, |m| m.remove_com_every);
+    // The centre-of-mass momentum stays zero under NVE, CSVR and Nosé–Hoover chains, but
+    // Langevin noise thermalizes it unless it is removed (the convention of GROMACS and OpenMM).
+    let langevin = matches!(
+        s.config.thermostat,
+        Some(ThermostatSection::Langevin { .. })
+    );
     let config = DynamicsConfig {
         dt_ps: s.config.run.timestep_fs * PS_PER_FS,
-        remove_com_every: s.config.momentum.as_ref().map_or(0, |m| m.remove_com_every),
-        com_removed: true,
+        remove_com_every,
+        com_removed: !(langevin && remove_com_every == 0),
         energy_every_step: false,
         virial_every_step: false,
     };
@@ -384,6 +526,14 @@ fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
     let start_step = dynamics.state().step;
     if let Some(c) = &checkpoint {
         dynamics.restore_thermostat_work(c.meta.thermostat_work_kjmol);
+        if let Err(e) = dynamics.restore_thermostat_state(&c.meta.thermostat_state) {
+            let file = restart.unwrap_or(Path::new("")).display();
+            if !force {
+                bail!("{file}: {e}");
+            }
+            // --force across a thermostat change, e.g. CSVR equilibration → NHC production
+            eprintln!("warning: {file}: {e}; the thermostat starts from a fresh state (--force)");
+        }
     }
     let mut observers = observers(&s, checkpoint.as_ref().map(|c| c.meta.step))?;
     let steps = s.config.run.steps.saturating_sub(start_step);
@@ -412,9 +562,10 @@ fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
         time_ps: 0.0,
         thermostat_work_kjmol: 0.0,
         thermostat_rng: None,
+        thermostat_state: Vec::new(),
     };
     eprintln!(
-        "ucmd {VERSION} ({GIT_HASH}): {} atoms, steps {start_step}..{} of {} fs, N_dof = {}{}",
+        "ucmd {VERSION} ({GIT_HASH}): {} atoms, steps {start_step}..{} of {} fs, N_dof = {}{}\n  hardware: {}",
         system.n_atoms(),
         start_step + steps,
         s.config.run.timestep_fs,
@@ -423,7 +574,8 @@ fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
             " (restart)"
         } else {
             ""
-        }
+        },
+        hardware::describe(s.threads)
     );
     let started = Instant::now();
     let outcome = runner::drive(
@@ -498,6 +650,7 @@ fn export(run_toml: &Path, checkpoint: &Path, out: &Path) -> Result<()> {
         "created_by": format!("ucmd {VERSION} ({GIT_HASH}) export of checkpoint step {}", c.meta.step),
         "created_utc": utc_now(),
         "notes": format!("time {} ps of the run {}", c.meta.time_ps, run_toml.display()),
+        "hardware": hardware::describe(s.threads),
         "derived_from": original,
     });
     std::fs::create_dir_all(out)?;

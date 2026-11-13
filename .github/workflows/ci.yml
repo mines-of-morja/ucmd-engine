@@ -8,9 +8,11 @@ permissions:
   contents: read
 
 env:
-  # Umbrella tag whose spec/ fixtures and tools/oracle/ references this engine is tested against.
-  # A spec change moves this pin in the same coordinated update (PLAN.md §9, spec churn).
-  UMBRELLA_REF: spec-v0.1.0
+  # Umbrella commit whose spec/ fixtures and tools/oracle/ references this engine is tested
+  # against: spec v0.1.0 plus the E2 molecule references (umbrella branch e2). A tag or commit
+  # hash, never a moving branch; it moves in the same coordinated update as the references or
+  # the spec (PLAN.md §9, spec churn).
+  UMBRELLA_REF: da27ef75f62860127d190635d97cdfee3a43078d
 
 jobs:
   rust:

@@ -1,6 +1,10 @@
 //! Neighbour search: a cell list on fractional coordinates builds a half Verlet list with skin
 //! (PLAN.md E1.8). Positions are unwrapped, so the rebuild test needs no minimum image.
+//!
+//! The rows are built in parallel and each is sorted, so the list does not depend on the number
+//! of threads (ADR 0010).
 
+use rayon::prelude::*;
 use ucmd_core::{Cell, Vec3};
 
 /// A half neighbour list (i < j) of all pairs within `cutoff + skin` at build time, stored in
@@ -36,6 +40,11 @@ impl NeighborList {
         &self.neighbors[self.offsets[i]..self.offsets[i + 1]]
     }
 
+    /// Number of pairs in the rows before atom `i` (`i` may be the atom count: all pairs).
+    pub fn pairs_before(&self, i: usize) -> usize {
+        self.offsets[i]
+    }
+
     /// Rebuild if needed; returns true if it rebuilt.
     pub fn update(&mut self, positions: &[Vec3], cell: Option<&Cell>) -> bool {
         let stale = self.positions_at_build.len() != positions.len()
@@ -54,47 +63,49 @@ impl NeighborList {
         let n = positions.len();
         let range = self.cutoff_nm + self.skin_nm;
         let range2 = range * range;
-        let mut lists: Vec<Vec<u32>> = vec![Vec::new(); n];
         let grid = cell.and_then(|c| CellGrid::new(c, range, positions));
-        match (&grid, cell) {
-            (Some(grid), Some(cell)) => {
-                for i in 0..n {
-                    let home = grid.cell_of[i];
-                    for neighbor_cell in grid.neighbor_cells(home) {
+        let lists: Vec<Vec<u32>> = match (&grid, cell) {
+            (Some(grid), Some(cell)) => (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    let mut list = Vec::new();
+                    for neighbor_cell in grid.neighbor_cells(grid.cell_of[i]) {
                         for &j in &grid.members[neighbor_cell] {
-                            let j = j as usize;
-                            if j > i
+                            if j as usize > i
                                 && cell
-                                    .minimum_image(positions[i] - positions[j])
+                                    .minimum_image(positions[i] - positions[j as usize])
                                     .length_squared()
                                     < range2
                             {
-                                lists[i].push(j as u32);
+                                list.push(j);
                             }
                         }
                     }
-                }
-            }
-            _ => {
-                // small cells (fewer than 3 grid cells along a direction) or no cell: all pairs
-                for i in 0..n {
-                    for j in i + 1..n {
-                        let mut d = positions[i] - positions[j];
-                        if let Some(cell) = cell {
-                            d = cell.minimum_image(d);
-                        }
-                        if d.length_squared() < range2 {
-                            lists[i].push(j as u32);
-                        }
-                    }
-                }
-            }
-        }
+                    list.sort_unstable(); // the same order for any cell traversal
+                    list
+                })
+                .collect(),
+            // small cells (fewer than 3 grid cells along a direction) or no cell: all pairs
+            _ => (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    (i + 1..n)
+                        .filter(|&j| {
+                            let mut d = positions[i] - positions[j];
+                            if let Some(cell) = cell {
+                                d = cell.minimum_image(d);
+                            }
+                            d.length_squared() < range2
+                        })
+                        .map(|j| j as u32)
+                        .collect()
+                })
+                .collect(),
+        };
         self.offsets.clear();
         self.neighbors.clear();
         self.offsets.push(0);
-        for mut list in lists {
-            list.sort_unstable(); // deterministic order regardless of the cell traversal
+        for list in lists {
             self.neighbors.extend_from_slice(&list);
             self.offsets.push(self.neighbors.len());
         }

@@ -5,7 +5,8 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use ucmd_force::{Observer, ObserverError, Snapshot};
 
-/// Writes `step, time, energies, temperature, pressure, volume, energy terms` as TSV.
+/// Writes `step, time, energies, temperature, pressure, volume, energy terms` as TSV, with the
+/// column names of spec/run-config.md (`conserved_energy_kjmol` is the conserved quantity).
 pub struct ThermoWriter {
     out: BufWriter<File>,
     every: u64,
@@ -89,7 +90,7 @@ impl Observer for ThermoWriter {
                 .map(|(n, _)| n.clone())
                 .collect();
             let mut header = String::from(
-                "# step\ttime_ps\tpotential_kjmol\tkinetic_kjmol\ttotal_kjmol\tconserved_kjmol\ttemperature_K\tpressure_bar\tvolume_nm3",
+                "# step\ttime_ps\tpotential_kjmol\tkinetic_kjmol\ttotal_kjmol\tconserved_energy_kjmol\ttemperature_K\tpressure_bar\tvolume_nm3",
             );
             for name in &names {
                 header.push_str(&format!("\tterm:{name}_kjmol"));

@@ -35,6 +35,8 @@ pub struct H5mdProvenance {
     pub run_config_toml: String,
     /// SHA-256 of system.json.
     pub system_sha256: String,
+    /// Backend, thread count and CPU model (ADR 0010); provenance only, never physics.
+    pub hardware: String,
 }
 
 fn err(context: &str) -> impl Fn(hdf5::Error) -> ObserverError + '_ {
@@ -373,6 +375,7 @@ impl H5mdWriter {
         attr_text(&ucmd, "engine_version", &provenance.engine_version)?;
         attr_text(&ucmd, "engine_git_hash", &provenance.git_hash)?;
         attr_text(&ucmd, "system_sha256", &provenance.system_sha256)?;
+        attr_text(&ucmd, "hardware", &provenance.hardware)?;
         attr_text(&ucmd, "positions", "unwrapped")?;
         for (name, value) in [
             ("system_json", &provenance.system_json),

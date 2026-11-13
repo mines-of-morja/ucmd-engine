@@ -1,0 +1,48 @@
+# M2a: 10 ps NVT of the minimized 1 M LiPF6 in EC:EMC 3:7 box (docs/design/E2.md §10).
+# Settings follow Lehnert et al. 2025, SI S1.1: Nosé–Hoover with 100 fs damping, velocity Verlet
+# with 1 fs steps, 1.4 nm cutoff, long-range Coulomb to an accuracy of 1e-5, velocities at 25 °C.
+# run.sh copies this file into out/nvt-*/, next to the minimized package.
+spec_version = "0.1.0"
+system = "../minimized.ucsys"
+title = "M2a: 1 M LiPF6 in EC:EMC 3:7, 10 ps NVT with Nosé–Hoover chains"
+
+[run]
+integrator = "velocity-verlet"
+timestep_fs = 1.0
+steps = 10000
+seed = 20261113
+
+[velocities]
+generate = "maxwell-boltzmann"
+temperature_K = 298.15
+
+[momentum]
+remove_com_every = 100 # GROMACS's default nstcomm; smooth PME does not conserve momentum exactly
+
+[thermostat]
+kind = "nose-hoover-chain"
+temperature_K = 298.15
+tau_ps = 0.1
+chain_length = 3
+
+[[providers]]
+kind = "force-field"
+cutoff_nm = 1.4
+coulomb = "pme"
+ewald_tolerance = 1e-5
+
+[output]
+directory = "out"
+
+[output.thermo]
+file = "thermo.tsv"
+every = 10
+
+[output.trajectory]
+file = "trajectory.h5"
+every = 100
+precision = "float32"
+
+[output.checkpoint]
+file = "checkpoint.ucchk"
+every = 1000
