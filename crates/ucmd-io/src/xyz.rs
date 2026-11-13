@@ -1,7 +1,8 @@
 //! Extended-XYZ debug trajectory for viewers (OVITO, VMD, ASE).
 //!
 //! Viewers expect Å, so this exporter is the one engine output in Å (a format boundary,
-//! CLAUDE.md invariant 3).
+//! CLAUDE.md invariant 3). Every frame is flushed when it is complete, so a viewer can open the
+//! trajectory of a running simulation.
 
 use crate::elements::symbol;
 use std::fs::File;
@@ -116,10 +117,49 @@ impl Observer for XyzWriter {
             let a = *r * ANGSTROM_PER_NM;
             writeln!(self.out, "{sym} {:.8} {:.8} {:.8}", a.x, a.y, a.z).map_err(io)?;
         }
-        Ok(())
+        self.out.flush().map_err(io)
     }
 
     fn finish(&mut self) -> Result<(), ObserverError> {
         self.out.flush().map_err(io)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ucmd_core::Vec3;
+    use ucmd_force::ForceResult;
+
+    /// Each frame is complete on disk once `observe` returns, so viewers can read a running
+    /// trajectory (ASE refuses a file whose last frame is cut).
+    #[test]
+    fn frames_are_complete_after_each_observation() {
+        let path = std::env::temp_dir().join(format!("ucmd-xyz-test-{}.xyz", std::process::id()));
+        let n = 2000; // a frame larger than the write buffer
+        let positions = vec![Vec3::new(0.1, 0.2, 0.3); n];
+        let velocities = vec![Vec3::ZERO; n];
+        let forces = ForceResult::default();
+        let mut writer = XyzWriter::create(&path, 1, &vec![6; n]).unwrap();
+        for step in 0..2u64 {
+            writer
+                .observe(&Snapshot {
+                    step,
+                    time_ps: 0.001 * step as f64,
+                    positions: &positions,
+                    velocities: &velocities,
+                    cell: None,
+                    forces: &forces,
+                    kinetic_energy: 0.0,
+                    temperature_k: 0.0,
+                    conserved_energy: None,
+                    pressure_bar: None,
+                })
+                .unwrap();
+            let text = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(text.lines().count(), (step as usize + 1) * (n + 2));
+        }
+        drop(writer);
+        std::fs::remove_file(&path).unwrap();
     }
 }
