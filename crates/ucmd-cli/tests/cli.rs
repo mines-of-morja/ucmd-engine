@@ -112,6 +112,27 @@ every = 10
         .unwrap();
     assert!(status.success());
     let table = std::fs::read_to_string(dir.join("out/thermo.tsv")).unwrap();
+    let header: Vec<&str> = table
+        .lines()
+        .next()
+        .unwrap()
+        .trim_start_matches("# ")
+        .split('\t')
+        .collect();
+    for name in [
+        "step",
+        "time_ps",
+        "temperature_K",
+        "pressure_bar",
+        "volume_nm3",
+        "conserved_energy_kjmol",
+    ] {
+        assert!(
+            header.contains(&name),
+            "column {name} of spec/run-config.md missing: {header:?}"
+        );
+    }
+    assert_eq!(header[5], "conserved_energy_kjmol");
     let conserved: Vec<f64> = table
         .lines()
         .filter(|l| !l.starts_with('#'))
