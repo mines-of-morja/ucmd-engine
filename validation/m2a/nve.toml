@@ -1,0 +1,28 @@
+# M2a energy check: 300 fs of NVE (no thermostat) from the minimized box, energies every step.
+# run.sh also runs it with half the time step, to show the step-size dependence of K + U.
+spec_version = "0.1.0"
+system = "../minimized.ucsys"
+title = "M2a: NVE energy check"
+
+[run]
+integrator = "velocity-verlet"
+timestep_fs = 1.0
+steps = 300
+seed = 20261113
+
+[velocities]
+generate = "maxwell-boltzmann"
+temperature_K = 298.15
+
+[[providers]]
+kind = "force-field"
+cutoff_nm = 1.4
+coulomb = "pme"
+ewald_tolerance = 1e-5
+
+[output]
+directory = "out"
+
+[output.thermo]
+file = "thermo.tsv"
+every = 1
