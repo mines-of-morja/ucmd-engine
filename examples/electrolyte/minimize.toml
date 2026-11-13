@@ -1,0 +1,19 @@
+# Electrolyte example, step 1: minimize the builder's box (FIRE until max |F| < 100 kJ/mol/nm).
+# Build the box first (see docs/testing.md §8 of the UnitcellMD umbrella repo):
+#   ../../../ucmd-builder/.venv/bin/ucmd-build build ../../../ucmd-builder/examples/lp57-1M.toml -o box.ucsys
+# Then:   ucmd minimize minimize.toml --out minimized.ucsys
+spec_version = "0.1.0"
+system = "box.ucsys"
+title = "Electrolyte example: minimization of 1 M LiPF6 in EC:EMC 3:7"
+
+[run]
+integrator = "velocity-verlet"
+timestep_fs = 1.0
+steps = 0
+seed = 1
+
+[[providers]]
+kind = "force-field"
+cutoff_nm = 1.4
+coulomb = "pme"
+ewald_tolerance = 1e-5
