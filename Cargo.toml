@@ -31,6 +31,8 @@ rand_chacha = { version = "0.10", features = ["serde"] }
 libm = "0.2"
 # FFT for PME (E2.4); the scalar planner keeps results machine-independent (ADR 0010)
 rustfft = "6.4"
+# Deterministic multithreading (E2 design §9): fixed chunks, fixed-order reductions (ADR 0010)
+rayon = "1.12"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 proptest = "1"

@@ -17,13 +17,20 @@
 //!   including the scaled 1-4 part). This is the split of the OpenMM oracle v1.
 //!
 //! All transcendental functions come from `libm` (ADR 0010).
+//!
+//! **Threads:** the pair list is cut into row chunks of about equal pair counts. The cut depends
+//! only on the list, never on the number of threads; each chunk sums into its own buffers, and
+//! the buffers are added in chunk order. Results are therefore bitwise identical on any number
+//! of threads (ADR 0010, E2 design §9).
 
 use crate::lj::CutoffMode;
 use crate::neighbor::NeighborList;
 use crate::pme::{Pme, grid_for};
 use crate::topology::PairTopology;
+use rayon::prelude::*;
 use serde::Deserialize;
 use std::f64::consts::PI;
+use std::ops::Range;
 use ucmd_core::units::COULOMB_KJMOL_NM_E2;
 use ucmd_core::{Cell, Mat3, System, Vec3};
 use ucmd_force::{Capabilities, EvalRequest, ForceError, ForceProvider, ForceResult, outer};
@@ -140,6 +147,112 @@ pub struct Nonbonded {
     tail_virial_v: f64,
     list: NeighborList,
     pme: Option<Pme>,
+    /// Per-chunk accumulators of the pair loop, kept between evaluations.
+    chunks: Vec<PairSums>,
+}
+
+/// Most chunks the pair loop is cut into.
+const MAX_CHUNKS: usize = 64;
+/// Fewest pairs per chunk, so small systems are not cut into tiny pieces.
+const MIN_CHUNK_PAIRS: usize = 4096;
+/// Atoms per task when the chunk buffers are added up.
+const REDUCE_BLOCK: usize = 1024;
+
+/// Row ranges with about equal pair counts; `pairs_before(i)` is the number of pairs in the rows
+/// before row `i`, and `pairs_before(n_rows)` the total. The ranges depend only on the counts.
+fn row_chunks(n_rows: usize, pairs_before: impl Fn(usize) -> usize) -> Vec<Range<usize>> {
+    let total = pairs_before(n_rows);
+    let wanted = total.div_ceil(MIN_CHUNK_PAIRS).clamp(1, MAX_CHUNKS);
+    let target = total.div_ceil(wanted).max(1);
+    let mut ranges = Vec::with_capacity(wanted);
+    let mut begin = 0;
+    for i in 0..n_rows {
+        if pairs_before(i + 1) >= target * (ranges.len() + 1) {
+            ranges.push(begin..i + 1);
+            begin = i + 1;
+        }
+    }
+    if begin < n_rows {
+        ranges.push(begin..n_rows);
+    }
+    ranges
+}
+
+/// What one chunk of the pair loop adds up.
+#[derive(Default)]
+struct PairSums {
+    forces: Vec<Vec3>,
+    e_lj: f64,
+    e_coul: f64,
+    virial: Mat3,
+}
+
+impl PairSums {
+    fn reset(&mut self, n: usize) {
+        self.forces.clear();
+        self.forces.resize(n, Vec3::ZERO);
+        self.e_lj = 0.0;
+        self.e_coul = 0.0;
+        self.virial = Mat3::ZERO;
+    }
+}
+
+/// The normal (non-excluded, non-1-4) pair interaction: LJ and real-space or direct Coulomb.
+struct PairKernel<'a> {
+    positions: &'a [Vec3],
+    cell: Option<&'a Cell>,
+    rc2: f64,
+    ewald: bool,
+    alpha: f64,
+    two_alpha_sqrt_pi: f64,
+    /// (σ, ε, energy shift) per ordered type pair.
+    pairs: &'a [(f64, f64, f64)],
+    type_of: &'a [usize],
+    n_types: usize,
+    charges: &'a [f64],
+    topology: &'a PairTopology,
+}
+
+impl PairKernel<'_> {
+    #[inline]
+    fn pair(&self, i: usize, j: usize, sums: &mut PairSums) {
+        if self.topology.skips(i, j) {
+            return;
+        }
+        let mut d = self.positions[i] - self.positions[j];
+        if let Some(cell) = self.cell {
+            d = cell.minimum_image(d);
+        }
+        let r2 = d.length_squared();
+        if r2 >= self.rc2 {
+            return;
+        }
+        let (sigma, epsilon, shift) = self.pairs[self.type_of[i] * self.n_types + self.type_of[j]];
+        let s2 = sigma * sigma / r2;
+        let s6 = s2 * s2 * s2;
+        sums.e_lj += 4.0 * epsilon * (s6 * s6 - s6) - shift;
+        let mut f_over_r = 24.0 * epsilon * (2.0 * s6 * s6 - s6) / r2;
+        let qq = self.charges[i] * self.charges[j];
+        if qq != 0.0 {
+            let r = r2.sqrt();
+            if self.ewald {
+                let ar = self.alpha * r;
+                let erfc_ar = erfc(ar);
+                sums.e_coul += COULOMB_KJMOL_NM_E2 * qq * erfc_ar / r;
+                f_over_r += COULOMB_KJMOL_NM_E2
+                    * qq
+                    * (erfc_ar / r + self.two_alpha_sqrt_pi * libm::exp(-ar * ar))
+                    / r2;
+            } else {
+                sums.e_coul += COULOMB_KJMOL_NM_E2 * qq / r;
+                f_over_r += COULOMB_KJMOL_NM_E2 * qq / (r2 * r);
+            }
+        }
+        let f = d * f_over_r;
+        sums.forces[i] += f;
+        sums.forces[j] -= f;
+        sums.virial += outer(d, f);
+    }
 }
 
 impl Nonbonded {
@@ -161,6 +274,7 @@ impl Nonbonded {
             tail_energy_v: 0.0,
             tail_virial_v: 0.0,
             pme: None,
+            chunks: Vec::new(),
         }
     }
 
@@ -375,70 +489,68 @@ impl ForceProvider for Nonbonded {
         let rc2 = cutoff.map_or(f64::INFINITY, |rc| rc * rc);
         let ewald = self.method != CoulombMethod::Direct;
         let alpha = self.alpha;
-        let two_alpha_sqrt_pi = 2.0 * alpha / PI.sqrt();
-        let (mut e_lj, mut e_lj14, mut e_coul) = (0.0, 0.0, 0.0);
-        let mut virial = Mat3::ZERO;
+        let mut e_lj14 = 0.0;
         if cutoff.is_some() {
             self.list.update(positions, cell);
         }
-        let (pairs, type_of, n_types, charges, topology) = (
-            &self.pairs,
-            &self.type_of,
-            self.n_types,
-            &self.charges,
-            &self.topology,
-        );
-        let forces = &mut out.forces;
-        let mut pair = |i: usize, j: usize| {
-            if topology.skips(i, j) {
-                return;
-            }
-            let mut d = positions[i] - positions[j];
-            if let Some(cell) = cell {
-                d = cell.minimum_image(d);
-            }
-            let r2 = d.length_squared();
-            if r2 >= rc2 {
-                return;
-            }
-            let (sigma, epsilon, shift) = pairs[type_of[i] * n_types + type_of[j]];
-            let s2 = sigma * sigma / r2;
-            let s6 = s2 * s2 * s2;
-            e_lj += 4.0 * epsilon * (s6 * s6 - s6) - shift;
-            let mut f_over_r = 24.0 * epsilon * (2.0 * s6 * s6 - s6) / r2;
-            let qq = charges[i] * charges[j];
-            if qq != 0.0 {
-                let r = r2.sqrt();
-                if ewald {
-                    let ar = alpha * r;
-                    let erfc_ar = erfc(ar);
-                    e_coul += COULOMB_KJMOL_NM_E2 * qq * erfc_ar / r;
-                    f_over_r += COULOMB_KJMOL_NM_E2
-                        * qq
-                        * (erfc_ar / r + two_alpha_sqrt_pi * libm::exp(-ar * ar))
-                        / r2;
-                } else {
-                    e_coul += COULOMB_KJMOL_NM_E2 * qq / r;
-                    f_over_r += COULOMB_KJMOL_NM_E2 * qq / (r2 * r);
-                }
-            }
-            let f = d * f_over_r;
-            forces[i] += f;
-            forces[j] -= f;
-            virial += outer(d, f);
+        let kernel = PairKernel {
+            positions,
+            cell,
+            rc2,
+            ewald,
+            alpha,
+            two_alpha_sqrt_pi: 2.0 * alpha / PI.sqrt(),
+            pairs: &self.pairs,
+            type_of: &self.type_of,
+            n_types: self.n_types,
+            charges: &self.charges,
+            topology: &self.topology,
         };
-        if cutoff.is_some() {
-            for i in 0..n {
-                for &j in self.list.neighbors(i) {
-                    pair(i, j as usize);
-                }
-            }
+        let list = &self.list;
+        let ranges = if cutoff.is_some() {
+            row_chunks(n, |i| list.pairs_before(i))
         } else {
-            for i in 0..n {
-                for j in i + 1..n {
-                    pair(i, j);
+            row_chunks(n, |i| i * n - i * (i + 1) / 2)
+        };
+        if self.chunks.len() < ranges.len() {
+            self.chunks.resize_with(ranges.len(), PairSums::default);
+        }
+        let chunks = &mut self.chunks[..ranges.len()];
+        chunks
+            .par_iter_mut()
+            .zip(ranges.par_iter())
+            .for_each(|(sums, rows)| {
+                sums.reset(n);
+                for i in rows.clone() {
+                    if cutoff.is_some() {
+                        for &j in list.neighbors(i) {
+                            kernel.pair(i, j as usize, sums);
+                        }
+                    } else {
+                        for j in i + 1..n {
+                            kernel.pair(i, j, sums);
+                        }
+                    }
                 }
-            }
+            });
+        // add the chunks up in chunk order: the same sums on any number of threads
+        let chunks = &self.chunks[..ranges.len()];
+        out.forces
+            .par_chunks_mut(REDUCE_BLOCK)
+            .enumerate()
+            .for_each(|(block, forces)| {
+                let start = block * REDUCE_BLOCK;
+                for sums in chunks {
+                    for (f, g) in forces.iter_mut().zip(&sums.forces[start..]) {
+                        *f += *g;
+                    }
+                }
+            });
+        let (mut e_lj, mut e_coul, mut virial) = (0.0, 0.0, Mat3::ZERO);
+        for sums in chunks {
+            e_lj += sums.e_lj;
+            e_coul += sums.e_coul;
+            virial += sums.virial;
         }
         // 1-4 pairs: plain LJ and Coulomb, scaled; no cutoff, no shift. Molecules are whole.
         for p in &self.p14 {
@@ -599,6 +711,123 @@ mod tests {
         FdOptions, determinism_check, energy_terms_check, fd_force_check, fd_virial_check,
         momentum_check,
     };
+
+    /// 256 bonded ion pairs (+1/−1 e, LJ type C) on a jittered rock-salt lattice of 512 sites,
+    /// 0.375 nm apart, in a 3 nm cubic box.
+    fn ion_pairs(periodic: bool) -> (System, Vec<Vec3>, Cell) {
+        use crate::test_util::Rng;
+        use ucmd_core::{AtomTemplate, Bond, BondForm, MoleculeType};
+        let atom = |name: &str, q: f64| AtomTemplate {
+            name: name.into(),
+            element: 6,
+            mass_amu: 12.011,
+            charge_e: Some(q),
+            atom_type: Some(0),
+        };
+        let pair = MoleculeType {
+            name: "ionpair".into(),
+            formal_charge_e: 0,
+            atoms: vec![atom("P", 1.0), atom("N", -1.0)],
+            bonds: vec![Bond {
+                atoms: [0, 1],
+                form: Some(BondForm::Harmonic {
+                    r0_nm: 0.375,
+                    k_kjmol_nm2: 1000.0,
+                }),
+            }],
+            angles: Vec::new(),
+            dihedrals: Vec::new(),
+            impropers: Vec::new(),
+            constraints: Vec::new(),
+        };
+        let system = system_of(vec![pair], &[(0, 256)], [periodic; 3]);
+        let (spacing, mut rng) = (0.375, Rng(17));
+        let mut positions = Vec::with_capacity(512);
+        for z in 0..8 {
+            for y in 0..8 {
+                for x in (0..8).step_by(2) {
+                    // rock-salt order: the cation sits where x + y + z is even
+                    let sites = if (y + z) % 2 == 0 {
+                        [x, x + 1]
+                    } else {
+                        [x + 1, x]
+                    };
+                    for site in sites {
+                        let jitter = Vec3::new(rng.uniform(), rng.uniform(), rng.uniform())
+                            - Vec3::splat(0.5);
+                        positions.push(
+                            Vec3::new(site as f64, y as f64, z as f64) * spacing + 0.06 * jitter,
+                        );
+                    }
+                }
+            }
+        }
+        let cell = Cell::new(
+            [[3.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 3.0]],
+            [true; 3],
+        )
+        .unwrap();
+        (system, positions, cell)
+    }
+
+    /// E2 design §9, ADR 0010: forces, energy terms and virial are bitwise identical on 1, 4
+    /// and 16 threads, with PME (several pair chunks, every PME stage threaded) and with direct
+    /// Coulomb (the all-pairs path).
+    #[test]
+    fn results_do_not_depend_on_the_thread_count() {
+        let pme = NonbondedConfig {
+            cutoff_nm: Some(0.9),
+            coulomb: Some(CoulombMethod::Pme),
+            pme_grid: Some([30, 32, 36]),
+            dispersion_correction: true,
+            ..NonbondedConfig::default()
+        };
+        let direct = NonbondedConfig {
+            coulomb: Some(CoulombMethod::Direct),
+            ..NonbondedConfig::default()
+        };
+        for (config, periodic) in [(pme, true), (direct, false)] {
+            let (system, positions, cell) = ion_pairs(periodic);
+            let cell = periodic.then_some(&cell);
+            let run = |threads: usize| {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                pool.install(|| {
+                    let mut p = provider(&system, config);
+                    let mut out = ForceResult::default();
+                    p.evaluate(&positions, cell, &EvalRequest::everything(), &mut out)
+                        .unwrap();
+                    (out, p.chunks.len())
+                })
+            };
+            let bits = |out: &ForceResult| {
+                let forces: Vec<u64> = out
+                    .forces
+                    .iter()
+                    .flat_map(|f| f.to_array().map(f64::to_bits))
+                    .collect();
+                let terms: Vec<(String, u64)> = out
+                    .energy_terms
+                    .iter()
+                    .map(|(name, e)| (name.clone(), e.to_bits()))
+                    .collect();
+                let virial = out.virial.map(|w| w.to_cols_array().map(f64::to_bits));
+                (forces, out.energy.map(f64::to_bits), terms, virial)
+            };
+            let (reference, chunks) = run(1);
+            assert!(chunks >= 4, "only {chunks} pair chunks");
+            for threads in [4, 16] {
+                let (other, _) = run(threads);
+                assert!(
+                    bits(&reference) == bits(&other),
+                    "{:?}: {threads} threads differ from 1",
+                    config.coulomb
+                );
+            }
+        }
+    }
 
     fn provider(system: &System, config: NonbondedConfig) -> Nonbonded {
         let mut p = Nonbonded::new("nonbonded", config);

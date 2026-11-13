@@ -177,11 +177,14 @@ struct Setup {
     #[cfg_attr(not(feature = "h5md"), allow(dead_code))] // only the H5MD writer reads it so far
     machine: MachineProfile,
     system_json: String,
+    /// Worker threads in use (machine profile; provenance only).
+    threads: usize,
 }
 
 fn setup(run_toml: &Path) -> Result<Setup> {
     let config = load_run_config(run_toml).map_err(spec)?;
     let machine = MachineProfile::load().map_err(spec)?;
+    let threads = hardware::start_threads(machine.threads)?;
     let package = read_package(&config.system_dir()).map_err(spec)?;
     for (code, message) in &package.warnings {
         eprintln!("warning: {code}  {message}");
@@ -193,6 +196,7 @@ fn setup(run_toml: &Path) -> Result<Setup> {
         package,
         machine,
         system_json,
+        threads,
     })
 }
 
@@ -260,7 +264,7 @@ fn minimize(run_toml: &Path, out: &Path, max_force: f64, max_steps: u64) -> Resu
     eprintln!(
         "ucmd {VERSION} ({GIT_HASH}) minimize: {} atoms, FIRE until max |F| < {max_force} kJ/mol/nm\n  hardware: {}",
         s.package.system.n_atoms(),
-        hardware::describe(1)
+        hardware::describe(s.threads)
     );
     let started = Instant::now();
     let report = ucmd_md::minimize::minimize(
@@ -310,7 +314,7 @@ fn minimize(run_toml: &Path, out: &Path, max_force: f64, max_steps: u64) -> Resu
             "max_force_kjmol_nm": report.max_force_kjmol_nm,
             "run_config_toml": s.config.resolved_toml(),
         },
-        "hardware": hardware::describe(1),
+        "hardware": hardware::describe(s.threads),
         "derived_from": original,
     });
     std::fs::create_dir_all(out)?;
@@ -407,7 +411,7 @@ fn h5md_writer(
                 system_json: s.system_json.clone(),
                 run_config_toml: s.config.resolved_toml(),
                 system_sha256: s.package.system.system_sha256.clone(),
-                hardware: hardware::describe(1),
+                hardware: hardware::describe(s.threads),
             };
             ucmd_io::H5mdWriter::create(path, &s.package.system, options, &provenance)
         }
@@ -571,7 +575,7 @@ fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
         } else {
             ""
         },
-        hardware::describe(1)
+        hardware::describe(s.threads)
     );
     let started = Instant::now();
     let outcome = runner::drive(
@@ -646,7 +650,7 @@ fn export(run_toml: &Path, checkpoint: &Path, out: &Path) -> Result<()> {
         "created_by": format!("ucmd {VERSION} ({GIT_HASH}) export of checkpoint step {}", c.meta.step),
         "created_utc": utc_now(),
         "notes": format!("time {} ps of the run {}", c.meta.time_ps, run_toml.display()),
-        "hardware": hardware::describe(1),
+        "hardware": hardware::describe(s.threads),
         "derived_from": original,
     });
     std::fs::create_dir_all(out)?;

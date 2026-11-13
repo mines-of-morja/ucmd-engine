@@ -12,7 +12,12 @@
 //!   under strain, so this is exact for the PME energy.
 //! - **FFT:** rustfft's scalar planner, so that results do not depend on CPU features
 //!   (ADR 0010).
+//! - **Threads:** charges are spread plane by plane, each plane adding its atoms in index order,
+//!   so the grid is the same as a serial spread; FFT lines are independent; energy and virial are
+//!   summed per plane, then over planes in order. Results are bitwise identical on any number of
+//!   threads.
 
+use rayon::prelude::*;
 use rustfft::num_complex::Complex64;
 use rustfft::{Fft, FftDirection, FftPlannerScalar};
 use std::f64::consts::PI;
@@ -99,6 +104,17 @@ fn bspline_moduli(order: usize, k: usize) -> Vec<f64> {
     moduli
 }
 
+/// Columns per task in the FFT along the first axis.
+const COLUMN_BLOCK: usize = 64;
+
+/// B-spline data of one atom: the first grid point per dimension and the weights.
+#[derive(Clone, Copy)]
+struct Spline {
+    base: [usize; 3],
+    theta: [[f64; 8]; 3],
+    dtheta: [[f64; 8]; 3],
+}
+
 /// The reciprocal-space solver for a fixed grid and order.
 pub struct Pme {
     order: usize,
@@ -107,8 +123,8 @@ pub struct Pme {
     forward: [Arc<dyn Fft<f64>>; 3],
     inverse: [Arc<dyn Fft<f64>>; 3],
     q: Vec<Complex64>,
-    line: Vec<Complex64>,
-    scratch: Vec<Complex64>,
+    longest: usize,
+    scratch_len: usize,
 }
 
 impl Pme {
@@ -141,8 +157,8 @@ impl Pme {
             forward,
             inverse,
             q: vec![Complex64::new(0.0, 0.0); grid[0] * grid[1] * grid[2]],
-            line: vec![Complex64::new(0.0, 0.0); longest],
-            scratch: vec![Complex64::new(0.0, 0.0); scratch_len],
+            longest,
+            scratch_len,
         })
     }
 
@@ -151,32 +167,67 @@ impl Pme {
         self.grid
     }
 
-    /// 3D FFT of `self.q` in place, along each axis in turn.
+    /// 3D FFT of `self.q` in place, along each axis in turn. Every line is transformed on its
+    /// own, so the result does not depend on how the lines are shared out among threads.
     fn fft3(&mut self, inverse: bool) {
         let [k0, k1, k2] = self.grid;
-        let strides = [k1 * k2, k2, 1];
-        for axis in 0..3 {
-            let (n, stride) = (self.grid[axis], strides[axis]);
-            let plan = if inverse {
-                &self.inverse[axis]
-            } else {
-                &self.forward[axis]
-            };
-            let total = k0 * k1 * k2;
-            for start in 0..total {
-                // the first element of each line along `axis`
-                if (start / stride) % n != 0 {
-                    continue;
-                }
-                for i in 0..n {
-                    self.line[i] = self.q[start + i * stride];
-                }
-                plan.process_with_scratch(&mut self.line[..n], &mut self.scratch);
-                for i in 0..n {
-                    self.q[start + i * stride] = self.line[i];
-                }
+        let plans = if inverse {
+            &self.inverse
+        } else {
+            &self.forward
+        };
+        let (longest, scratch_len) = (self.longest, self.scratch_len);
+        let buffers = || {
+            (
+                vec![Complex64::new(0.0, 0.0); longest],
+                vec![Complex64::new(0.0, 0.0); scratch_len],
+            )
+        };
+        // axis 0: columns across the planes, handed out in blocks of columns
+        let plan = &plans[0];
+        let mut blocks: Vec<Vec<&mut [Complex64]>> = (0..(k1 * k2).div_ceil(COLUMN_BLOCK))
+            .map(|_| Vec::with_capacity(k0))
+            .collect();
+        for plane in self.q.chunks_mut(k1 * k2) {
+            for (block, piece) in blocks.iter_mut().zip(plane.chunks_mut(COLUMN_BLOCK)) {
+                block.push(piece);
             }
         }
+        blocks
+            .par_iter_mut()
+            .for_each_init(buffers, |(line, scratch), pieces| {
+                for column in 0..pieces[0].len() {
+                    for (x, piece) in line.iter_mut().zip(pieces.iter()) {
+                        *x = piece[column];
+                    }
+                    plan.process_with_scratch(&mut line[..k0], scratch);
+                    for (x, piece) in line.iter().zip(pieces.iter_mut()) {
+                        piece[column] = *x;
+                    }
+                }
+            });
+        // axis 1: strided lines within each plane
+        let plan = &plans[1];
+        self.q
+            .par_chunks_mut(k1 * k2)
+            .for_each_init(buffers, |(line, scratch), plane| {
+                for c in 0..k2 {
+                    for (b, x) in line[..k1].iter_mut().enumerate() {
+                        *x = plane[b * k2 + c];
+                    }
+                    plan.process_with_scratch(&mut line[..k1], scratch);
+                    for (b, x) in line[..k1].iter().enumerate() {
+                        plane[b * k2 + c] = *x;
+                    }
+                }
+            });
+        // axis 2: contiguous lines
+        let plan = &plans[2];
+        self.q
+            .par_chunks_mut(k2)
+            .for_each_init(buffers, |(_, scratch), line| {
+                plan.process_with_scratch(line, scratch);
+            });
     }
 
     /// Reciprocal energy and virial; forces are added to `forces`.
@@ -194,48 +245,53 @@ impl Pme {
         let hinv = cell.h().inverse();
         let astar = [hinv.row(0), hinv.row(1), hinv.row(2)];
         let volume = cell.volume();
+        let grid = self.grid;
         // B-spline weights per atom and dimension
-        let n = positions.len();
-        let mut base = vec![[0usize; 3]; n];
-        let mut theta = vec![[[0.0f64; 8]; 3]; n];
-        let mut dtheta = vec![[[0.0f64; 8]; 3]; n];
-        for (i, &r) in positions.iter().enumerate() {
-            let s = hinv * r;
-            for d in 0..3 {
-                let frac = s[d] - libm::floor(s[d]);
-                let u = frac * kf[d];
-                let i0 = libm::floor(u);
-                let w = u - i0;
-                base[i][d] = i0 as usize % self.grid[d];
-                bspline(p, w, &mut theta[i][d], &mut dtheta[i][d]);
-            }
-        }
-        let index = |g: [usize; 3]| (g[0] * k1 + g[1]) * k2 + g[2];
+        let splines: Vec<Spline> = positions
+            .par_iter()
+            .map(|&r| {
+                let s = hinv * r;
+                let mut spline = Spline {
+                    base: [0; 3],
+                    theta: [[0.0; 8]; 3],
+                    dtheta: [[0.0; 8]; 3],
+                };
+                for d in 0..3 {
+                    let frac = s[d] - libm::floor(s[d]);
+                    let u = frac * kf[d];
+                    let i0 = libm::floor(u);
+                    let w = u - i0;
+                    spline.base[d] = i0 as usize % grid[d];
+                    bspline(p, w, &mut spline.theta[d], &mut spline.dtheta[d]);
+                }
+                spline
+            })
+            .collect();
         let wrap = |b: usize, j: usize, k: usize| (b + k - j % k) % k;
-        // spread
+        // spread, plane by plane; each plane adds its atoms in index order, as a serial spread
         self.q
-            .iter_mut()
-            .for_each(|x| *x = Complex64::new(0.0, 0.0));
-        for i in 0..n {
-            let q = charges[i];
-            if q == 0.0 {
-                continue;
-            }
-            for a in 0..p {
-                let ga = wrap(base[i][0], a, k0);
-                let ta = q * theta[i][0][a];
-                for b in 0..p {
-                    let gb = wrap(base[i][1], b, k1);
-                    let tab = ta * theta[i][1][b];
-                    for (c, &tc) in theta[i][2][..p].iter().enumerate() {
-                        let gc = wrap(base[i][2], c, k2);
-                        self.q[index([ga, gb, gc])].re += tab * tc;
+            .par_chunks_mut(k1 * k2)
+            .enumerate()
+            .for_each(|(ga, plane)| {
+                plane.iter_mut().for_each(|x| *x = Complex64::new(0.0, 0.0));
+                for (s, &q) in splines.iter().zip(charges) {
+                    let a = (s.base[0] + k0 - ga) % k0; // ga = base₀ − a (mod K₀)
+                    if q == 0.0 || a >= p {
+                        continue;
+                    }
+                    let ta = q * s.theta[0][a];
+                    for b in 0..p {
+                        let gb = wrap(s.base[1], b, k1);
+                        let tab = ta * s.theta[1][b];
+                        for (c, &tc) in s.theta[2][..p].iter().enumerate() {
+                            let gc = wrap(s.base[2], c, k2);
+                            plane[gb * k2 + gc].re += tab * tc;
+                        }
                     }
                 }
-            }
-        }
+            });
         self.fft3(false);
-        // energy, virial and the convolution in reciprocal space
+        // energy, virial and the convolution in reciprocal space, summed per plane
         let prefactor = COULOMB_KJMOL_NM_E2 / (2.0 * PI * volume);
         let pi2_alpha2 = PI * PI / (alpha * alpha);
         let signed = |m: usize, k: usize| {
@@ -245,57 +301,74 @@ impl Pme {
                 m as f64 - k as f64
             }
         };
+        let moduli = &self.moduli;
+        let planes: Vec<(f64, Mat3)> = self
+            .q
+            .par_chunks_mut(k1 * k2)
+            .enumerate()
+            .map(|(m0, plane)| {
+                let mut energy = 0.0;
+                let mut virial = Mat3::ZERO;
+                for m1 in 0..k1 {
+                    for m2 in 0..k2 {
+                        let at = m1 * k2 + m2;
+                        if m0 == 0 && m1 == 0 && m2 == 0 {
+                            plane[at] = Complex64::new(0.0, 0.0);
+                            continue;
+                        }
+                        let mvec = signed(m0, k0) * astar[0]
+                            + signed(m1, k1) * astar[1]
+                            + signed(m2, k2) * astar[2];
+                        let m2v = mvec.length_squared();
+                        let bc = libm::exp(-pi2_alpha2 * m2v)
+                            / (m2v * moduli[0][m0] * moduli[1][m1] * moduli[2][m2]);
+                        let e_m = prefactor * bc * plane[at].norm_sqr();
+                        energy += e_m;
+                        let factor = 2.0 * (1.0 / m2v + pi2_alpha2);
+                        virial += (Mat3::IDENTITY - outer(mvec, mvec) * factor) * e_m;
+                        // potential: ∂E/∂Q(k) = (k_e/(πV)) Re Σ_m BC(m) Q̂(m) e^{+2πimk/K}
+                        plane[at] *= 2.0 * prefactor * bc;
+                    }
+                }
+                (energy, virial)
+            })
+            .collect();
         let mut energy = 0.0;
         let mut virial = Mat3::ZERO;
-        for m0 in 0..k0 {
-            for m1 in 0..k1 {
-                for m2 in 0..k2 {
-                    let at = index([m0, m1, m2]);
-                    if m0 == 0 && m1 == 0 && m2 == 0 {
-                        self.q[at] = Complex64::new(0.0, 0.0);
-                        continue;
-                    }
-                    let mvec = signed(m0, k0) * astar[0]
-                        + signed(m1, k1) * astar[1]
-                        + signed(m2, k2) * astar[2];
-                    let m2v = mvec.length_squared();
-                    let bc = libm::exp(-pi2_alpha2 * m2v)
-                        / (m2v * self.moduli[0][m0] * self.moduli[1][m1] * self.moduli[2][m2]);
-                    let e_m = prefactor * bc * self.q[at].norm_sqr();
-                    energy += e_m;
-                    let factor = 2.0 * (1.0 / m2v + pi2_alpha2);
-                    virial += (Mat3::IDENTITY - outer(mvec, mvec) * factor) * e_m;
-                    // potential: ∂E/∂Q(k) = (k_e/(πV)) Re Σ_m BC(m) Q̂(m) e^{+2πimk/K}
-                    self.q[at] *= 2.0 * prefactor * bc;
-                }
-            }
+        for (e, w) in planes {
+            energy += e;
+            virial += w;
         }
         self.fft3(true);
-        // forces: F_i = −q_i Σ_g φ(g) ∇(θ₁θ₂θ₃)
-        for i in 0..n {
-            let q = charges[i];
-            if q == 0.0 {
-                continue;
-            }
-            let mut g = Vec3::ZERO; // gradient of Σ φ θθθ with respect to (u₁, u₂, u₃)
-            for a in 0..p {
-                let ga = wrap(base[i][0], a, k0);
-                let (ta, da) = (theta[i][0][a], dtheta[i][0][a]);
-                for b in 0..p {
-                    let gb = wrap(base[i][1], b, k1);
-                    let (tb, db) = (theta[i][1][b], dtheta[i][1][b]);
-                    for c in 0..p {
-                        let gc = wrap(base[i][2], c, k2);
-                        let (tc, dc) = (theta[i][2][c], dtheta[i][2][c]);
-                        let phi = self.q[index([ga, gb, gc])].re;
-                        g += phi * Vec3::new(da * tb * tc, ta * db * tc, ta * tb * dc);
+        // forces: F_i = −q_i Σ_g φ(g) ∇(θ₁θ₂θ₃), each atom on its own
+        let phi_grid = &self.q;
+        let index = |g: [usize; 3]| (g[0] * k1 + g[1]) * k2 + g[2];
+        forces
+            .par_iter_mut()
+            .zip(splines.par_iter().zip(charges.par_iter()))
+            .for_each(|(force, (s, &q))| {
+                if q == 0.0 {
+                    return;
+                }
+                let mut g = Vec3::ZERO; // gradient of Σ φ θθθ with respect to (u₁, u₂, u₃)
+                for a in 0..p {
+                    let ga = wrap(s.base[0], a, k0);
+                    let (ta, da) = (s.theta[0][a], s.dtheta[0][a]);
+                    for b in 0..p {
+                        let gb = wrap(s.base[1], b, k1);
+                        let (tb, db) = (s.theta[1][b], s.dtheta[1][b]);
+                        for c in 0..p {
+                            let gc = wrap(s.base[2], c, k2);
+                            let (tc, dc) = (s.theta[2][c], s.dtheta[2][c]);
+                            let phi = phi_grid[index([ga, gb, gc])].re;
+                            g += phi * Vec3::new(da * tb * tc, ta * db * tc, ta * tb * dc);
+                        }
                     }
                 }
-            }
-            // ∂u_d/∂r = K_d a*_d
-            let grad = g.x * kf[0] * astar[0] + g.y * kf[1] * astar[1] + g.z * kf[2] * astar[2];
-            forces[i] -= q * grad;
-        }
+                // ∂u_d/∂r = K_d a*_d
+                let grad = g.x * kf[0] * astar[0] + g.y * kf[1] * astar[1] + g.z * kf[2] * astar[2];
+                *force -= q * grad;
+            });
         (energy, virial)
     }
 }
