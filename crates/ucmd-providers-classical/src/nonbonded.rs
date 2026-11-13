@@ -18,10 +18,11 @@
 //!
 //! All transcendental functions come from `libm` (ADR 0010).
 //!
-//! **Threads:** the pair list is cut into row chunks of about equal pair counts. The cut depends
-//! only on the list, never on the number of threads; each chunk sums into its own buffers, and
-//! the buffers are added in chunk order. Results are therefore bitwise identical on any number
-//! of threads (ADR 0010, E2 design §9).
+//! **Threads:** the rows of the pair list are cut into chunks whose boundaries depend only on the
+//! atom count, never on the list (which a restart rebuilds elsewhere) or on the number of
+//! threads. Each chunk sums into its own buffers, and the buffers are added in chunk order.
+//! Results are therefore bitwise identical on any number of threads and across restarts
+//! (ADR 0010, E2 design §9).
 
 use crate::lj::CutoffMode;
 use crate::neighbor::NeighborList;
@@ -153,27 +154,32 @@ pub struct Nonbonded {
 
 /// Most chunks the pair loop is cut into.
 const MAX_CHUNKS: usize = 64;
-/// Fewest pairs per chunk, so small systems are not cut into tiny pieces.
+/// Fewest pairs per chunk (counting every pair of the rows), so small systems are not cut into
+/// tiny pieces.
 const MIN_CHUNK_PAIRS: usize = 4096;
 /// Atoms per task when the chunk buffers are added up.
 const REDUCE_BLOCK: usize = 1024;
 
-/// Row ranges with about equal pair counts; `pairs_before(i)` is the number of pairs in the rows
-/// before row `i`, and `pairs_before(n_rows)` the total. The ranges depend only on the counts.
-fn row_chunks(n_rows: usize, pairs_before: impl Fn(usize) -> usize) -> Vec<Range<usize>> {
-    let total = pairs_before(n_rows);
+/// Row ranges for the pair loop. The boundaries depend only on the atom count, never on the
+/// neighbour list or the number of threads: a restart rebuilds the list at other positions
+/// than a continuous run, and both must add the same pairs in the same order. Row i of the half
+/// list holds the partners j > i, so its work falls linearly with i; the ranges take equal
+/// shares of i·n − i(i+1)/2, the pair count of the rows before i if every pair interacted.
+fn row_chunks(n: usize) -> Vec<Range<usize>> {
+    let pairs_before = |i: usize| i * n - i * (i + 1) / 2;
+    let total = pairs_before(n);
     let wanted = total.div_ceil(MIN_CHUNK_PAIRS).clamp(1, MAX_CHUNKS);
     let target = total.div_ceil(wanted).max(1);
     let mut ranges = Vec::with_capacity(wanted);
     let mut begin = 0;
-    for i in 0..n_rows {
+    for i in 0..n {
         if pairs_before(i + 1) >= target * (ranges.len() + 1) {
             ranges.push(begin..i + 1);
             begin = i + 1;
         }
     }
-    if begin < n_rows {
-        ranges.push(begin..n_rows);
+    if begin < n {
+        ranges.push(begin..n);
     }
     ranges
 }
@@ -507,11 +513,7 @@ impl ForceProvider for Nonbonded {
             topology: &self.topology,
         };
         let list = &self.list;
-        let ranges = if cutoff.is_some() {
-            row_chunks(n, |i| list.pairs_before(i))
-        } else {
-            row_chunks(n, |i| i * n - i * (i + 1) / 2)
-        };
+        let ranges = row_chunks(n);
         if self.chunks.len() < ranges.len() {
             self.chunks.resize_with(ranges.len(), PairSums::default);
         }
@@ -827,6 +829,74 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A restart rebuilds the neighbour list at other positions than the continuous run did.
+    /// Results must not depend on where the list was built: the same pairs are added in the
+    /// same order. (Found by M2a: chunks cut by the list's pair counts broke bitwise restarts.)
+    #[test]
+    fn results_do_not_depend_on_where_the_list_was_built() {
+        use crate::test_util::Rng;
+        let config = NonbondedConfig {
+            cutoff_nm: Some(0.9),
+            coulomb: Some(CoulombMethod::Pme),
+            pme_grid: Some([30, 32, 36]),
+            ..NonbondedConfig::default()
+        };
+        let (system, x1, cell) = ion_pairs(true);
+        // x0 differs by less than half the skin (0.1 nm) per atom, so a list built at x0 serves x1
+        let mut rng = Rng(5);
+        let x0: Vec<Vec3> = x1
+            .iter()
+            .map(|r| {
+                *r + 0.1
+                    * (Vec3::new(rng.uniform(), rng.uniform(), rng.uniform()) - Vec3::splat(0.5))
+            })
+            .collect();
+        let request = EvalRequest::everything();
+        let mut continued = provider(&system, config);
+        let mut out = ForceResult::default();
+        continued
+            .evaluate(&x0, Some(&cell), &request, &mut out)
+            .unwrap();
+        continued
+            .evaluate(&x1, Some(&cell), &request, &mut out)
+            .unwrap();
+        assert_eq!(
+            continued.list.builds(),
+            1,
+            "the list built at x0 must serve x1"
+        );
+        let mut fresh = provider(&system, config);
+        let mut out_fresh = ForceResult::default();
+        fresh
+            .evaluate(&x1, Some(&cell), &request, &mut out_fresh)
+            .unwrap();
+        let n = x1.len();
+        assert_ne!(
+            continued.list.pairs_before(n),
+            fresh.list.pairs_before(n),
+            "the two lists should differ, or the test shows nothing"
+        );
+        let bits = |v: &[Vec3]| {
+            v.iter()
+                .flat_map(|f| f.to_array().map(f64::to_bits))
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            bits(&out.forces) == bits(&out_fresh.forces),
+            "forces differ"
+        );
+        assert_eq!(
+            out.energy.map(f64::to_bits),
+            out_fresh.energy.map(f64::to_bits)
+        );
+        assert_eq!(
+            out.virial.map(|w| w.to_cols_array().map(f64::to_bits)),
+            out_fresh
+                .virial
+                .map(|w| w.to_cols_array().map(f64::to_bits))
+        );
     }
 
     fn provider(system: &System, config: NonbondedConfig) -> Nonbonded {
