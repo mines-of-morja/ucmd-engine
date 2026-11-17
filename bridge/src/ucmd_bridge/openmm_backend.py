@@ -30,6 +30,7 @@ import contextlib
 import hashlib
 import json
 import math
+import os
 import signal
 import sys
 import time
@@ -48,6 +49,10 @@ from .package import load as load_package
 BOLTZMANN_KJMOL_K = 1.380649e-23 * 6.02214076e23 / 1000.0  # CODATA 2018, exact
 BAR_PER_KJMOL_NM3 = 1e25 / 6.02214076e23
 MAGIC = b"UCMDOMM1\n"
+# ADR 0012 (precision tiers): the model-identity check of a mixed-precision run allows larger
+# pointwise force differences (single-precision forces: 5.5e-5 measured for the electrolyte);
+# mixed precision itself is admitted by a statistical comparison with double precision.
+FORCE_TOLERANCE = {"double": None, "mixed": 2e-4, "single": 2e-4}
 SYMBOL = {z: s for s, z in ATOMIC_NUMBER.items()}
 
 
@@ -167,7 +172,25 @@ class Stop:
         self.signal = signum
 
 
-def conformance(context, reference: Path, unit) -> dict:
+def environment() -> dict:
+    """Software and hardware stack of this run (ADR 0012: environment pinning)."""
+    import glob
+    import platform as pyplatform
+
+    out = {"python": pyplatform.python_version(), "host_kernel": pyplatform.release()}
+    for pattern, key in (
+        ("/opt/rocm-venv/lib/python*/site-packages/rocm_sdk_core-*.dist-info", "rocm_sdk"),
+    ):
+        found = glob.glob(pattern)
+        if found:
+            out[key] = Path(found[0]).name.split("-")[1].removesuffix(".dist-info")
+    for var, key in (("UCMD_OPENMM_IMAGE", "image"), ("UCMD_OPENMM_IMAGE_ID", "image_id")):
+        if os.environ.get(var):
+            out[key] = os.environ[var]
+    return out
+
+
+def conformance(context, reference: Path, unit, precision: str) -> dict:
     """Evaluate the reference configuration and compare with the CPU reference backend."""
     import openmm as mm
 
@@ -190,11 +213,13 @@ def conformance(context, reference: Path, unit) -> dict:
         "reference_energy_kjmol": e_ref,
         "energy_kjmol": energy,
     }
-    if de > ref["tolerance_energy_relative"] or df > ref["tolerance_force_relative"]:
+    force_tolerance = FORCE_TOLERANCE.get(precision) or ref["tolerance_force_relative"]
+    result["conformance_force_tolerance"] = force_tolerance
+    if de > ref["tolerance_energy_relative"] or df > force_tolerance:
         raise ModelError(
             f"conformance check failed: energy {energy:.6f} vs {e_ref:.6f} kJ/mol "
             f"(relative {de:.1e}, tolerance {ref['tolerance_energy_relative']:.0e}), "
-            f"forces max relative {df:.1e} (tolerance {ref['tolerance_force_relative']:.0e})"
+            f"forces max relative {df:.1e} (tolerance {force_tolerance:.0e}, {precision})"
         )
     return result
 
@@ -241,6 +266,11 @@ def run(args: argparse.Namespace) -> int:
     else:
         integrator = velocity_verlet(plan.dt_ps)
 
+    if args.precision != "double" and plan.thermostat is None:
+        raise ConfigError(
+            f"{args.precision} precision is for thermostatted production runs (ADR 0012); "
+            "NVE and validation runs use double"
+        )
     platform = mm.Platform.getPlatformByName(args.platform)
     properties = {}
     if args.platform in ("OpenCL", "CUDA", "HIP"):
@@ -254,7 +284,7 @@ def run(args: argparse.Namespace) -> int:
             device += context.getPlatform().getPropertyValue(context, name) + " "
     check = {}
     if args.reference is not None:
-        check = conformance(context, Path(args.reference), unit)
+        check = conformance(context, Path(args.reference), unit, args.precision)
     elif not args.no_conformance:
         raise ConfigError("--reference is required (written by `ucmd run`); see --no-conformance")
 
@@ -306,6 +336,7 @@ def run(args: argparse.Namespace) -> int:
             "electrostatics": json.dumps(electrostatics),
             "barostat": "MonteCarloBarostat" if plan.barostat else "none",
             "pressure": "molecular, MonteCarloBarostat.computeCurrentPressure",
+            **environment(),
             **{k: v for k, v in check.items() if isinstance(v, (int, float, str))},
         },
     }

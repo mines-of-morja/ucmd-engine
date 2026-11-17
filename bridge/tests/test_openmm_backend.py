@@ -232,3 +232,15 @@ def test_the_nose_hoover_chain_is_the_engines(tmp_path: Path) -> None:
     for column in ("temperature_K", "potential_kjmol", "conserved_energy_kjmol"):
         k = names.index(column)
         assert np.allclose(gpu[:, k], cpu[:, k], rtol=1e-6), column
+
+
+def test_mixed_precision_needs_a_thermostat(tmp_path: Path) -> None:
+    """ADR 0012: mixed precision for thermostatted production runs only; NVE runs use double."""
+    text = ARGON.format(steps=20, thermostat="nose-hoover-chain").replace(
+        '[thermostat]\nkind = "nose-hoover-chain"\ntemperature_K = 94.4\ntau_ps = 0.5\n', ""
+    )
+    assert "[thermostat]" not in text
+    profile = setup_run(tmp_path, "argon-864", text)
+    profile.write_text(profile.read_text() + 'precision = "mixed"\n')
+    r = ucmd(tmp_path, profile)
+    assert r.returncode == 2 and "ADR 0012" in r.stderr

@@ -1,0 +1,38 @@
+# ADR 0012 precision check, drift: 200 ps NVT from the end state of the double-precision NPT run
+# (exported with ucmd-openmm's last frame), once per precision.
+spec_version = "0.1.0"
+system = "../equilibrated.ucsys"
+title = "ADR 0012 precision check: pure EMC, NVT drift, 25 °C"
+
+[run]
+integrator = "velocity-verlet"
+timestep_fs = 1.0
+steps = 200000
+seed = 2013
+
+[velocities]
+generate = "maxwell-boltzmann"
+temperature_K = 298.15
+
+[momentum]
+remove_com_every = 100
+
+[thermostat]
+kind = "nose-hoover-chain"
+temperature_K = 298.15
+tau_ps = 0.1
+chain_length = 3
+
+[[providers]]
+kind = "force-field"
+cutoff_nm = 1.4
+coulomb = "pme"
+ewald_tolerance = 1e-5
+dispersion_correction = true
+
+[output]
+directory = "out"
+
+[output.thermo]
+file = "thermo.tsv"
+every = 100

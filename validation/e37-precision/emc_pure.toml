@@ -1,0 +1,21 @@
+# Pure EMC, 500 molecules, in a box at its manufacturer density (Lehnert 2025 SI Table S2).
+# The NPT run then finds the force field's own density at 1 atm.
+format = "ucmd-build"
+version = "0.1"
+name = "emc_pure"
+description = "pure EMC, 500 molecules; start at the Lehnert 2025 SI Table S2 density"
+seed = 20261117
+component = [
+    { name = "EMC", molecule = { library = "EMC" }, count = 500 },
+]
+
+[forcefield]
+source = "library"
+set = "opls-aa-carbonates"
+
+[box]
+length_nm = 4.4126
+
+[packing]
+method = "packmol"
+tolerance_nm = 0.2

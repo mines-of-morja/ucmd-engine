@@ -21,5 +21,7 @@ done
 for dir in "$WORKSPACE" "$PWD" ${UCMD_OPENMM_MOUNTS:-}; do
   args+=(-v "$dir:$dir")
 done
+# ADR 0012: the run records which image it ran in
+args+=(-e "UCMD_OPENMM_IMAGE=$IMAGE" -e "UCMD_OPENMM_IMAGE_ID=$(docker image inspect -f '{{.Id}}' "$IMAGE")")
 exec docker run "${args[@]}" -w "$PWD" --user "$(id -u):$(id -g)" -e HOME=/tmp \
   -e PYTHONPATH="$BRIDGE/src" "$IMAGE" python -m ucmd_bridge.openmm_backend "$@"
