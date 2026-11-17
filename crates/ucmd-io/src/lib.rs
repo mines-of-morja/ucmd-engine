@@ -26,8 +26,8 @@ pub mod xyz;
 
 pub use checkpoint::{Checkpoint, CheckpointError, CheckpointMeta, RestartRecord};
 pub use config::{
-    FileOutput, Integrator, MachineProfile, MomentumSection, OutputSection, RunConfig,
-    ThermostatSection, TrajectoryOutput, VelocitiesSection, load_run_config,
+    BackendSection, FileOutput, Integrator, MachineProfile, MomentumSection, OutputSection,
+    RunConfig, ThermostatSection, TrajectoryOutput, VelocitiesSection, load_run_config,
 };
 pub use error::{ErrorCode, SpecError};
 #[cfg(feature = "h5md")]

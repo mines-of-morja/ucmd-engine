@@ -25,7 +25,9 @@ use ucmd_io::{
     MachineProfile, Package, RunConfig, SpecError, ThermostatSection, load_run_config, read_package,
 };
 use ucmd_md::kinetics::{degrees_of_freedom, remove_angular_momentum, remove_com_velocity};
-use ucmd_md::random::{STREAM_BAROSTAT, STREAM_THERMOSTAT, STREAM_VELOCITIES, stream};
+use ucmd_md::random::{
+    STREAM_BAROSTAT, STREAM_CONFORMANCE, STREAM_THERMOSTAT, STREAM_VELOCITIES, stream,
+};
 use ucmd_md::velocities::maxwell_boltzmann;
 use ucmd_md::{
     CRescale, CRescaleConfig, Csvr, Dynamics, DynamicsConfig, Langevin, NoseHooverChain, Thermostat,
@@ -460,8 +462,111 @@ fn h5md_writer(
     )
 }
 
+/// Displacement (nm, standard deviation per component) of the conformance configuration: thermal
+/// size, so that relative force differences are meaningful even for a minimized start.
+const CONFORMANCE_DISPLACEMENT_NM: f64 = 0.01;
+
+/// E3.7 (ADR 0010): hand the run to an external backend after writing the reference single
+/// point it must reproduce. The configuration is the package's start positions, displaced by a
+/// seeded 0.01 nm; the backend evaluates exactly these positions and refuses to run if energy
+/// or forces differ beyond the tolerances in the reference file.
+fn run_external_backend(
+    s: &Setup,
+    run_toml: &Path,
+    restart: Option<&Path>,
+    force: bool,
+    backend: &ucmd_io::BackendSection,
+) -> Result<()> {
+    let exe = s.machine.executables.get("ucmd-openmm").ok_or_else(|| {
+        anyhow!("backend \"openmm\" needs [executables] ucmd-openmm in the machine profile")
+    })?;
+    let state = &s.package.state;
+    let mut rng = stream(s.config.run.seed, STREAM_CONFORMANCE);
+    let mut noise = || CONFORMANCE_DISPLACEMENT_NM * ucmd_md::random::standard_normal(&mut rng);
+    let positions: Vec<ucmd_core::Vec3> = state
+        .positions
+        .iter()
+        .map(|r| *r + ucmd_core::Vec3::new(noise(), noise(), noise()))
+        .collect();
+    let mut provider = Guarded::new(registry::make_providers(&s.config, state)?);
+    provider
+        .initialize(&s.package.system)
+        .map_err(|e| anyhow!("{e}"))?;
+    let mut out = ForceResult::default();
+    let request = EvalRequest {
+        need_virial: provider.capabilities().virial,
+        ..EvalRequest::everything()
+    };
+    provider
+        .evaluate(&positions, state.cell.as_ref(), &request, &mut out)
+        .map_err(|e| anyhow!("{e}"))?;
+    let dir = s.config.output_dir().join("backend-reference");
+    std::fs::create_dir_all(&dir)?;
+    ucmd_io::npy::write_vec3_array(&dir.join("positions.npy"), &positions)?;
+    ucmd_io::npy::write_vec3_array(&dir.join("forces.npy"), &out.forces)?;
+    let cell = state
+        .cell
+        .as_ref()
+        .map(|c| c.rows().iter().map(|v| v.to_array()).collect::<Vec<_>>());
+    let reference = serde_json::json!({
+        "energy_kjmol": out.energy,
+        "cell_nm": cell,
+        "displacement_nm": CONFORMANCE_DISPLACEMENT_NM,
+        "tolerance_energy_relative": 1e-6,
+        "tolerance_force_relative": 1e-5,
+        "engine": format!("ucmd {VERSION} ({GIT_HASH})"),
+        "system_sha256": s.package.system.system_sha256,
+    });
+    std::fs::write(
+        dir.join("reference.json"),
+        serde_json::to_string_pretty(&reference)?,
+    )?;
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("run")
+        .arg(run_toml)
+        .arg("--reference")
+        .arg(&dir)
+        .arg("--platform")
+        .arg(backend.platform.as_deref().unwrap_or("OpenCL"))
+        .arg("--precision")
+        .arg(backend.precision.as_deref().unwrap_or("double"));
+    if let Some(d) = &backend.device {
+        command.arg("--device").arg(d);
+    }
+    if let Some(r) = restart {
+        command.arg("--restart").arg(r);
+    }
+    if force {
+        command.arg("--force");
+    }
+    eprintln!(
+        "ucmd {VERSION} ({GIT_HASH}): backend openmm via {} (reference single point in {})",
+        exe.display(),
+        dir.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // exec: the backend receives SIGINT/SIGTERM directly and stops gracefully itself
+        Err(anyhow!(
+            "could not start {}: {}",
+            exe.display(),
+            command.exec()
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let status = command.status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
 fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
     let s = setup(run_toml)?;
+    if let Some(b) = s.machine.backend.as_ref().filter(|b| b.kind == "openmm") {
+        return run_external_backend(&s, run_toml, restart, force, b);
+    }
     let system = &s.package.system;
     let checkpoint = restart
         .map(ucmd_io::Checkpoint::read)

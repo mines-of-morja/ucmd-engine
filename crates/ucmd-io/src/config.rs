@@ -444,6 +444,30 @@ pub struct MachineProfile {
     /// Absolute paths of external programs by name.
     #[serde(default)]
     pub executables: BTreeMap<String, PathBuf>,
+    /// The simulation backend (E3.7, ADR 0010): the reference CPU engine by default.
+    #[serde(default)]
+    pub backend: Option<BackendSection>,
+}
+
+/// `[backend]` of the machine profile: which hardware runs `ucmd run` (E3.7, ADR 0010).
+///
+/// `kind = "reference"` (default) is the engine itself. `kind = "openmm"` hands the run to the
+/// external program `[executables] ucmd-openmm` (the OpenMM bridge) after a conformance single
+/// point; `platform`, `precision` and `device` are passed to it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendSection {
+    /// "reference" or "openmm".
+    pub kind: String,
+    /// OpenMM platform, e.g. "OpenCL" (default), "CPU", "Reference".
+    #[serde(default)]
+    pub platform: Option<String>,
+    /// "double" (default), "mixed" or "single".
+    #[serde(default)]
+    pub precision: Option<String>,
+    /// Device index on the platform, e.g. "0".
+    #[serde(default)]
+    pub device: Option<String>,
 }
 
 impl MachineProfile {
@@ -468,6 +492,19 @@ impl MachineProfile {
             .map_err(|e| SpecError::new(ErrorCode::Toml, e.to_string(), &location))?;
         let profile: Self = toml::from_str(&text)
             .map_err(|e| SpecError::new(ErrorCode::Schema, e.to_string(), &location))?;
+        if let Some(b) = &profile.backend {
+            let ok = ["reference", "openmm"].contains(&b.kind.as_str())
+                && b.precision
+                    .as_deref()
+                    .is_none_or(|p| ["double", "mixed", "single"].contains(&p));
+            if !ok {
+                return Err(SpecError::new(
+                    ErrorCode::Schema,
+                    "backend: kind must be \"reference\" or \"openmm\", precision \"double\", \"mixed\" or \"single\"",
+                    &location,
+                ));
+            }
+        }
         if let Some((name, exe)) = profile.executables.iter().find(|(_, p)| !p.is_absolute()) {
             return Err(SpecError::new(
                 ErrorCode::Path,

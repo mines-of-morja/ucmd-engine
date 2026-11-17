@@ -42,3 +42,35 @@ jobs:
         run: scripts/check-architecture.sh
       - name: Build without HDF5 (ADR 0002/0004)
         run: cargo build --workspace --no-default-features
+
+  bridge:
+    # E3.7: the OpenMM bridge on OpenMM's Reference platform (no GPU in CI): the whole chain
+    # `ucmd run` → conformance → ucmd-openmm, spec outputs, restarts, the integrators.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Spec fixtures and validator from the umbrella repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/UnitcellMD
+          ref: ${{ env.UMBRELLA_REF }}
+          path: _umbrella
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build ucmd
+        run: cargo build --release -p ucmd-cli
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the bridge with OpenMM
+        run: |
+          python -m venv bridge/.venv
+          bridge/.venv/bin/pip install -e 'bridge[openmm,dev]' _umbrella/spec/validator
+      - name: Lint
+        run: |
+          bridge/.venv/bin/ruff check bridge
+          bridge/.venv/bin/ruff format --check bridge
+      - name: Test
+        run: bridge/.venv/bin/pytest bridge/tests
+        env:
+          UCMD_SPEC_DIR: ${{ github.workspace }}/_umbrella/spec
