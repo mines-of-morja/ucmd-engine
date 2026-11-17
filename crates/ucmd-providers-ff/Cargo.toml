@@ -1,0 +1,20 @@
+[package]
+name = "ucmd-providers-ff"
+description = "The ucmd-ff force-field engine as an in-process force provider for UnitcellMD (kind \"ucmd-ff\")."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ucmd-core.workspace = true
+ucmd-force.workspace = true
+ucmd-ff.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+ucmd-force = { workspace = true, features = ["testkit"] }

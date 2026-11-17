@@ -9,14 +9,16 @@ use ucmd_providers_classical::{
     Bonded, ForceField, HarmonicTether, LennardJones, LennardJonesConfig, Nonbonded,
     NonbondedConfig,
 };
+use ucmd_providers_ff::{UcmdFf, UcmdFfConfig};
 
 /// The provider kinds this build knows.
-pub const KINDS: [&str; 5] = [
+pub const KINDS: [&str; 6] = [
     "bonded",
     "force-field",
     "harmonic-tether",
     "lennard-jones",
     "nonbonded",
+    "ucmd-ff",
 ];
 
 /// Build one provider from its `[[providers]]` table.
@@ -39,6 +41,12 @@ pub fn make_provider(table: &toml::Table, initial: &State) -> Result<Box<dyn For
             } else {
                 Box::new(Nonbonded::new(kind, config))
             })
+        }
+        "ucmd-ff" => {
+            let config: UcmdFfConfig = value
+                .try_into()
+                .context("[[providers]] kind = \"ucmd-ff\"")?;
+            Ok(Box::new(UcmdFf::new(kind, config)))
         }
         "bonded" => {
             if value.as_table().is_some_and(|t| !t.is_empty()) {

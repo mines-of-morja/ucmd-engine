@@ -18,6 +18,10 @@ The plan, the shared spec and the agent rules live in the umbrella repository
   - bonds, angles, proper and improper dihedrals;
   - Lennard-Jones with exclusions and scaled 1-4 pairs;
   - Coulomb direct, Ewald or smooth PME;
+- an alternative provider, `ucmd-ff`: the separately developed force-field engine
+  [ucmd-ff](https://github.com/mines-of-morja/ucmd-ff). It covers the same terms, with direct
+  Coulomb or classic Ewald. It is a second, independent implementation for cross-checks and
+  small systems. `run.toml` switches between the two by `kind` (below);
 - a FIRE minimizer (`ucmd minimize`);
 - H5MD trajectories; exact checkpoints and restarts;
 - threads that change only the speed: results are bitwise identical on any machine and for
@@ -58,12 +62,39 @@ The number of threads comes from the machine profile (`threads`, default all log
 | `ucmd-force` | `ForceProvider` contract, result guard, composite provider, observers, provider test kit |
 | `ucmd-providers-classical` | harmonic, Lennard-Jones, neighbour lists, bonded terms, nonbonded with Ewald and PME, the `force-field` provider |
 | `ucmd-providers-ipi` | out-of-process providers over the i-PI socket protocol (E3) |
+| `ucmd-providers-ff` | the `ucmd-ff` provider: adapter to the external ucmd-ff library (own repository, sibling checkout `../ucmd-ff`) |
 | `ucmd-md` | velocity Verlet as operators, CSVR, Nosé–Hoover chains, Langevin BAOAB, FIRE, kinetics, Maxwell–Boltzmann velocities, run loop |
 | `ucmd-io` | package and run-config readers, NPY, thermo/XYZ/H5MD writers, H5MD reader, checkpoints |
 | `ucmd-cli` | the `ucmd` binary; the only crate that knows the concrete providers |
 
 `ucmd-md` depends only on `ucmd-core` and `ucmd-force`. `scripts/check-architecture.sh`
 enforces all dependency rules.
+
+## Choosing the force field
+
+Both classical providers read the same package parameters. One `[[providers]]` table selects
+one of them:
+
+```toml
+[[providers]]
+kind = "force-field"        # the engine's own: neighbour lists, PME, threads
+cutoff_nm = 1.2
+coulomb = "pme"
+
+# or
+
+[[providers]]
+kind = "ucmd-ff"            # ucmd-ff: all pairs, or minimum image + classic Ewald
+cutoff_nm = 1.2             # periodic systems only; also the real-space Ewald cutoff
+ewald_tolerance = 1e-5      # α = √(−ln 2δ)/r_c, as for force-field; or ewald_alpha_per_nm
+```
+
+ucmd-ff agrees with the engine's provider and with OpenMM:
+- the OpenMM molecule references (EC, EMC, LiPF₆, all bonded forms) to 1e-8 per term;
+- the engine's classic Ewald at the same α to about 1e-12;
+- `crates/ucmd-cli/tests/ucmd_ff_provider.rs`.
+
+Its pair loops are O(N²), so it is meant for checks and small systems, not production speed.
 
 ## Build and test
 

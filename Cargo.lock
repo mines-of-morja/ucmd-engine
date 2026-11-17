@@ -1106,6 +1106,7 @@ dependencies = [
  "ucmd-io",
  "ucmd-md",
  "ucmd-providers-classical",
+ "ucmd-providers-ff",
  "ucmd-providers-ipi",
 ]
 
@@ -1117,6 +1118,10 @@ dependencies = [
  "proptest",
  "thiserror",
 ]
+
+[[package]]
+name = "ucmd-ff"
+version = "0.1.0"
 
 [[package]]
 name = "ucmd-force"
@@ -1162,6 +1167,16 @@ dependencies = [
  "rustfft",
  "serde",
  "ucmd-core",
+ "ucmd-force",
+]
+
+[[package]]
+name = "ucmd-providers-ff"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "ucmd-core",
+ "ucmd-ff",
  "ucmd-force",
 ]
 
