@@ -6,7 +6,13 @@
 //!
 //! The step writes into spare buffers and swaps only after a successful force evaluation, so
 //! after a provider error the state of the last completed step is intact (emergency checkpoint).
+//!
+//! An optional barostat (C-rescale, E2.7) acts every n-th step between the drift and the force
+//! evaluation: it scales the drifted positions, the half-kicked velocities and the cell, so the
+//! forces always belong to the scaled configuration. Its pressure is that of the state at the
+//! start of the step; the run loop requests the virial for those states.
 
+use crate::barostat::CRescale;
 use crate::kinetics::{
     degrees_of_freedom, kinetic_energy, kinetic_tensor, pressure_tensor_bar, remove_com_velocity,
     temperature,
@@ -98,6 +104,8 @@ pub struct Dynamics<P: ForceProvider> {
     spare_velocities: Vec<Vec3>,
     thermostat: Option<Box<dyn Thermostat>>,
     thermostat_work: f64,
+    barostat: Option<CRescale>,
+    barostat_work: f64,
 }
 
 impl<P: ForceProvider> Dynamics<P> {
@@ -142,6 +150,8 @@ impl<P: ForceProvider> Dynamics<P> {
             next_forces: ForceResult::default(),
             thermostat,
             thermostat_work: 0.0,
+            barostat: None,
+            barostat_work: 0.0,
         };
         let request = EvalRequest {
             step: dynamics.state.step,
@@ -163,6 +173,55 @@ impl<P: ForceProvider> Dynamics<P> {
                 source,
             })?;
         Ok(dynamics)
+    }
+
+    /// Add a barostat. It needs a fully periodic cell, a provider that returns the virial, and
+    /// the virial of the current state (the initial evaluation requests it when the provider can).
+    pub fn with_barostat(mut self, barostat: CRescale) -> Result<Self, RunError> {
+        if !self
+            .state
+            .cell
+            .as_ref()
+            .is_some_and(|c| c.periodic().iter().all(|&p| p))
+        {
+            return Err(RunError::Setup(
+                "a barostat needs a fully periodic cell".into(),
+            ));
+        }
+        if !self.provider.capabilities().virial || self.forces.virial.is_none() {
+            return Err(RunError::Setup(
+                "a barostat needs the virial, which the force provider does not return".into(),
+            ));
+        }
+        self.barostat = Some(barostat);
+        Ok(self)
+    }
+
+    /// The barostat, e.g. to save its random-generator state in a checkpoint.
+    pub fn barostat(&self) -> Option<&CRescale> {
+        self.barostat.as_ref()
+    }
+
+    /// Mutable access to the barostat, e.g. to restore its generator after a restart.
+    pub fn barostat_mut(&mut self) -> Option<&mut CRescale> {
+        self.barostat.as_mut()
+    }
+
+    /// Energy the barostat has put into K + U + P₀V so far (kJ/mol).
+    pub fn barostat_work(&self) -> f64 {
+        self.barostat_work
+    }
+
+    /// Restore the accumulated barostat work after a restart (kJ/mol).
+    pub fn restore_barostat_work(&mut self, work: f64) {
+        self.barostat_work = work;
+    }
+
+    /// Whether the barostat acts in the step that starts from `step`.
+    fn barostat_acts_at(&self, step: u64) -> bool {
+        self.barostat
+            .as_ref()
+            .is_some_and(|b| step % b.every() == 0)
     }
 
     /// Advance by one step with the configured energy/virial requests. On error the state is
@@ -222,19 +281,24 @@ impl<P: ForceProvider> Dynamics<P> {
                 dt,
             );
         }
+        // Barostat: scale the drifted positions, the velocities and the cell (E2.7).
+        let mut new_cell = None;
+        let mut barostat_work = 0.0;
+        if self.barostat_acts_at(self.state.step) {
+            let (cell, work) = self.rescale(dt)?;
+            new_cell = Some(cell);
+            barostat_work = work;
+        }
         let request = EvalRequest {
             step: next_step,
             time_ps: self.state.time_ps + dt,
             need_energy,
-            need_virial: need_virial && self.provider.capabilities().virial,
+            need_virial: (need_virial || self.barostat_acts_at(next_step))
+                && self.provider.capabilities().virial,
         };
+        let cell = new_cell.as_ref().or(self.state.cell.as_ref());
         self.provider
-            .evaluate(
-                &self.spare_positions,
-                self.state.cell.as_ref(),
-                &request,
-                &mut self.next_forces,
-            )
+            .evaluate(&self.spare_positions, cell, &request, &mut self.next_forces)
             .map_err(|source| RunError::Provider {
                 step: next_step,
                 source,
@@ -255,9 +319,51 @@ impl<P: ForceProvider> Dynamics<P> {
         std::mem::swap(&mut self.state.velocities, &mut self.spare_velocities);
         std::mem::swap(&mut self.forces, &mut self.next_forces);
         self.thermostat_work += work;
+        if let Some(cell) = new_cell {
+            self.state.cell = Some(cell);
+            self.barostat_work += barostat_work;
+        }
         self.state.step = next_step;
         self.state.time_ps += dt;
         Ok(())
+    }
+
+    /// One C-rescale move: scale the spare positions and velocities, and return the scaled cell
+    /// and the energy the move puts into K + U + P₀V (kJ/mol). The change of U is the
+    /// first-order estimate −tr(W)·dε/3 from the virial of the state at the start of the step.
+    fn rescale(&mut self, dt: f64) -> Result<(ucmd_core::Cell, f64), RunError> {
+        let setup = |m: &str| RunError::Setup(m.to_string());
+        let cell = self
+            .state
+            .cell
+            .as_ref()
+            .ok_or_else(|| setup("barostat without a cell"))?;
+        let virial = self
+            .forces
+            .virial
+            .ok_or_else(|| setup("barostat step without the virial of the current state"))?;
+        let volume = cell.volume();
+        let p = pressure_tensor_bar(
+            kinetic_tensor(&self.state.velocities, &self.masses),
+            virial,
+            volume,
+        );
+        let pressure = (p.x_axis.x + p.y_axis.y + p.z_axis.z) / 3.0;
+        let barostat = self.barostat.as_mut().ok_or_else(|| setup("no barostat"))?;
+        let d_eps = barostat.d_log_volume(pressure, volume, dt);
+        let p0 = barostat.pressure_kjmol_nm3();
+        let mu = libm::exp(d_eps / 3.0);
+        let new_cell = cell
+            .scaled(mu)
+            .map_err(|e| setup(&format!("barostat: the scaled cell is invalid: {e}")))?;
+        let k_before = kinetic_energy(&self.spare_velocities, &self.masses);
+        self.spare_positions.iter_mut().for_each(|x| *x *= mu);
+        self.spare_velocities.iter_mut().for_each(|v| *v /= mu);
+        let k_after = kinetic_energy(&self.spare_velocities, &self.masses);
+        let trace_w = virial.x_axis.x + virial.y_axis.y + virial.z_axis.z;
+        let du = -trace_w * d_eps / 3.0;
+        let work = (k_after - k_before) + du + p0 * (new_cell.volume() - volume);
+        Ok((new_cell, work))
     }
 
     /// Run `steps` steps, calling `observe` after each completed step.
@@ -383,15 +489,22 @@ impl<P: ForceProvider> Dynamics<P> {
 
     /// The conserved quantity in kJ/mol, constant for exact dynamics: K + U + the bath energy
     /// for extended-system thermostats (Nosé–Hoover chains), otherwise K + U − the work done by
-    /// the thermostat.
+    /// the thermostat. With a barostat, + P₀V − the energy the barostat put in.
     pub fn conserved_energy(&self) -> Option<f64> {
         let bath = self
             .thermostat
             .as_ref()
             .and_then(|t| t.bath_energy(self.dof));
-        self.potential_energy().map(|u| match bath {
-            Some(b) => self.kinetic_energy() + u + b,
-            None => self.kinetic_energy() + u - self.thermostat_work,
+        let barostat = match (&self.barostat, &self.state.cell) {
+            (Some(b), Some(c)) => b.pressure_kjmol_nm3() * c.volume() - self.barostat_work,
+            _ => 0.0,
+        };
+        self.potential_energy().map(|u| {
+            barostat
+                + match bath {
+                    Some(b) => self.kinetic_energy() + u + b,
+                    None => self.kinetic_energy() + u - self.thermostat_work,
+                }
         })
     }
 
@@ -460,7 +573,160 @@ mod tests {
         }
     }
 
+    /// Non-interacting particles in a periodic box: zero forces, energy and virial.
+    struct IdealGas;
+
+    impl ForceProvider for IdealGas {
+        fn name(&self) -> &str {
+            "ideal-gas"
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                periodic: true,
+                virial: true,
+                energy_terms: false,
+                deterministic: true,
+            }
+        }
+        fn initialize(&mut self, _: &System) -> Result<(), ForceError> {
+            Ok(())
+        }
+        fn evaluate(
+            &mut self,
+            _: &[Vec3],
+            cell: Option<&Cell>,
+            _: &EvalRequest,
+            out: &mut ForceResult,
+        ) -> Result<(), ForceError> {
+            assert!(cell.is_some());
+            out.energy = Some(0.0);
+            out.forces.iter_mut().for_each(|f| *f = Vec3::ZERO);
+            out.virial = Some(ucmd_core::Mat3::ZERO);
+            Ok(())
+        }
+    }
+
+    fn ideal_gas_npt(n: usize, steps: u64) -> (Dynamics<IdealGas>, Vec<f64>) {
+        use crate::barostat::{CRescale, CRescaleConfig};
+        use crate::random::{STREAM_BAROSTAT, STREAM_THERMOSTAT, STREAM_VELOCITIES, stream};
+        use crate::thermostat::Csvr;
+        use crate::velocities::maxwell_boltzmann;
+
+        let system = particles_in(&vec![39.948; n], [true; 3]);
+        // MD removes the centre-of-mass momentum; C-rescale's k_BT/V term assumes so.
+        let v0 = maxwell_boltzmann(
+            system.masses(),
+            300.0,
+            3.0 * n as f64 - 3.0,
+            true,
+            &mut stream(3, STREAM_VELOCITIES),
+        );
+        let positions = (0..n)
+            .map(|i| Vec3::new(0.1 * i as f64, 0.05 * i as f64, 0.0))
+            .collect();
+        let cell = Cell::new(
+            [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]],
+            [true; 3],
+        )
+        .unwrap();
+        let state = State::new(positions, Some(v0), Some(cell));
+        let thermostat = Box::new(Csvr::new(300.0, 0.1, stream(3, STREAM_THERMOSTAT)));
+        let barostat = CRescale::new(
+            CRescaleConfig {
+                pressure_bar: 100.0,
+                tau_ps: 0.1,
+                compressibility_per_bar: 0.01, // ≈ 1/P₀, an ideal gas's own compressibility
+                every: 1,
+                temperature_k: 300.0,
+            },
+            stream(3, STREAM_BAROSTAT),
+        )
+        .unwrap();
+        let config = DynamicsConfig {
+            com_removed: true,
+            ..DynamicsConfig::nve(0.002)
+        };
+        let mut md = Dynamics::new(&system, IdealGas, state, config, Some(thermostat))
+            .unwrap()
+            .with_barostat(barostat)
+            .unwrap();
+        let mut volumes = Vec::new();
+        md.run(steps, |m| {
+            volumes.push(m.state().cell.as_ref().unwrap().volume())
+        })
+        .unwrap();
+        (md, volumes)
+    }
+
+    /// C-rescale samples the isothermal-isobaric ensemble. For an ideal gas of N particles the
+    /// volume distribution is p(V) ∝ V^N exp(−P₀V/k_BT), so ⟨V⟩ = (N+1) k_BT/P₀ and
+    /// Var V = (N+1)(k_BT/P₀)² (Bernetti & Bussi 2020, the k_BT/V term of their Eq. 5).
+    #[test]
+    fn c_rescale_samples_the_ideal_gas_volume_distribution() {
+        use ucmd_core::units::{BAR_PER_KJMOL_NM3, BOLTZMANN_KJMOL_K};
+        let n = 20;
+        let (_md, volumes) = ideal_gas_npt(n, 400_000);
+        let v = &volumes[20_000..];
+        let kt_over_p = BOLTZMANN_KJMOL_K * 300.0 / (100.0 / BAR_PER_KJMOL_NM3);
+        let mean = v.iter().sum::<f64>() / v.len() as f64;
+        let var = v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / v.len() as f64;
+        // block averages: 40 blocks of 9500 steps (≫ the ~50-step correlation time)
+        let block = v.len() / 40;
+        let means: Vec<f64> = v
+            .chunks_exact(block)
+            .map(|c| c.iter().sum::<f64>() / c.len() as f64)
+            .collect();
+        let m = means.iter().sum::<f64>() / means.len() as f64;
+        let err = (means.iter().map(|x| (x - m).powi(2)).sum::<f64>()
+            / (means.len() * (means.len() - 1)) as f64)
+            .sqrt();
+        let expected_mean = (n as f64 + 1.0) * kt_over_p;
+        let expected_var = (n as f64 + 1.0) * kt_over_p * kt_over_p;
+        eprintln!(
+            "<V> {mean:.4} ± {err:.4} (expected {expected_mean:.4}), Var V {var:.4} (expected {expected_var:.4})"
+        );
+        assert!((mean - expected_mean).abs() < 4.0 * err + 0.005 * expected_mean);
+        assert!((var / expected_var - 1.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn a_barostat_needs_a_periodic_cell_and_the_virial() {
+        use crate::barostat::{CRescale, CRescaleConfig};
+        use crate::random::{STREAM_BAROSTAT, stream};
+        let barostat = || {
+            CRescale::new(
+                CRescaleConfig {
+                    pressure_bar: 1.0,
+                    tau_ps: 1.0,
+                    compressibility_per_bar: 4.5e-5,
+                    every: 10,
+                    temperature_k: 300.0,
+                },
+                stream(1, STREAM_BAROSTAT),
+            )
+            .unwrap()
+        };
+        let system = particles(&[1.0]);
+        let state = State::new(vec![Vec3::ZERO], None, None);
+        let md = Dynamics::new(
+            &system,
+            Tether(1.0),
+            state,
+            DynamicsConfig::nve(0.001),
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            md.with_barostat(barostat()),
+            Err(RunError::Setup(_))
+        ));
+    }
+
     pub(crate) fn particles(masses: &[f64]) -> System {
+        particles_in(masses, [false; 3])
+    }
+
+    pub(crate) fn particles_in(masses: &[f64], periodicity: [bool; 3]) -> System {
         let atoms = masses
             .iter()
             .enumerate()
@@ -482,7 +748,7 @@ mod tests {
             impropers: vec![],
             constraints: vec![],
         };
-        System::new("test", vec![mtype], &[(0, 1)], None, [false; 3]).unwrap()
+        System::new("test", vec![mtype], &[(0, 1)], None, periodicity).unwrap()
     }
 
     /// max |E(t) − E₀|/E₀ for a 1D oscillator started at the minimum (q = 0, v = 1 nm/ps).

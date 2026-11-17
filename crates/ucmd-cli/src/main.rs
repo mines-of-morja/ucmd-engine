@@ -25,9 +25,11 @@ use ucmd_io::{
     MachineProfile, Package, RunConfig, SpecError, ThermostatSection, load_run_config, read_package,
 };
 use ucmd_md::kinetics::{degrees_of_freedom, remove_angular_momentum, remove_com_velocity};
-use ucmd_md::random::{STREAM_THERMOSTAT, STREAM_VELOCITIES, stream};
+use ucmd_md::random::{STREAM_BAROSTAT, STREAM_THERMOSTAT, STREAM_VELOCITIES, stream};
 use ucmd_md::velocities::maxwell_boltzmann;
-use ucmd_md::{Csvr, Dynamics, DynamicsConfig, Langevin, NoseHooverChain, Thermostat};
+use ucmd_md::{
+    CRescale, CRescaleConfig, Csvr, Dynamics, DynamicsConfig, Langevin, NoseHooverChain, Thermostat,
+};
 
 /// Engine version and git commit, for provenance.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -542,9 +544,40 @@ fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
             )))
         }
     };
-    if s.config.barostat.is_some() {
-        bail!("barostats arrive in E2.7");
-    }
+    let barostat = match &s.config.barostat {
+        None => None,
+        Some(b) => {
+            if b.coupling.as_deref() == Some("anisotropic") {
+                bail!("anisotropic pressure coupling is not implemented yet (E2.7 has isotropic)");
+            }
+            let temperature_k = match &s.config.thermostat {
+                Some(
+                    ThermostatSection::Csvr { temperature_k, .. }
+                    | ThermostatSection::NoseHooverChain { temperature_k, .. }
+                    | ThermostatSection::Langevin { temperature_k, .. },
+                ) => *temperature_k,
+                None => bail!("a barostat needs a thermostat: C-rescale takes its temperature"),
+            };
+            let rng = match checkpoint
+                .as_ref()
+                .and_then(|c| c.meta.barostat_rng.clone())
+            {
+                Some(saved) => serde_json::from_value::<rand_chacha::ChaCha8Rng>(saved)?,
+                None => stream(s.config.run.seed, STREAM_BAROSTAT),
+            };
+            let config = CRescaleConfig {
+                pressure_bar: b.pressure_bar,
+                tau_ps: b.tau_ps,
+                compressibility_per_bar: b.compressibility_per_bar,
+                every: b.every.unwrap_or(10),
+                temperature_k,
+            };
+            Some(
+                CRescale::new(config, rng)
+                    .ok_or_else(|| anyhow!("barostat parameters out of range"))?,
+            )
+        }
+    };
     let provider = registry::make_providers(&s.config, &state)?;
     let remove_com_every = s.config.momentum.as_ref().map_or(0, |m| m.remove_com_every);
     // The centre-of-mass momentum stays zero under NVE, CSVR and Nosé–Hoover chains, but
@@ -562,9 +595,13 @@ fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
     };
     let mut dynamics =
         Dynamics::new(system, provider, state, config, thermostat).map_err(|e| anyhow!("{e}"))?;
+    if let Some(b) = barostat {
+        dynamics = dynamics.with_barostat(b).map_err(|e| anyhow!("{e}"))?;
+    }
     let start_step = dynamics.state().step;
     if let Some(c) = &checkpoint {
         dynamics.restore_thermostat_work(c.meta.thermostat_work_kjmol);
+        dynamics.restore_barostat_work(c.meta.barostat_work_kjmol);
         if let Err(e) = dynamics.restore_thermostat_state(&c.meta.thermostat_state) {
             let file = restart.unwrap_or(Path::new("")).display();
             if !force {
@@ -613,6 +650,8 @@ fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
         thermostat_work_kjmol: 0.0,
         thermostat_rng: None,
         thermostat_state: Vec::new(),
+        barostat_work_kjmol: 0.0,
+        barostat_rng: None,
     };
     eprintln!(
         "ucmd {VERSION} ({GIT_HASH}): {} atoms, steps {start_step}..{} of {} fs, N_dof = {}{}\n  hardware: {}",

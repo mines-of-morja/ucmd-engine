@@ -5,12 +5,14 @@
 //! - [`kinetics`]: kinetic energy and tensor, temperature, degrees of freedom, pressure tensor,
 //!   momentum removal.
 //! - [`thermostat`]: the operator trait and CSVR (E1.6).
+//! - [`barostat`]: C-rescale (E2.7), isotropic stochastic cell rescaling.
 //! - [`velocities`]: Maxwell–Boltzmann initial velocities.
 //! - [`random`]: per-purpose random streams derived from the master seed.
 //!
 //! Architecture rule (CLAUDE.md invariant 1): this crate depends only on `ucmd-core` and
 //! `ucmd-force`, never on a provider crate. `scripts/check-architecture.sh` enforces this.
 
+pub mod barostat;
 pub mod dynamics;
 pub mod kinetics;
 pub mod minimize;
@@ -18,5 +20,6 @@ pub mod random;
 pub mod thermostat;
 pub mod velocities;
 
+pub use barostat::{CRescale, CRescaleConfig};
 pub use dynamics::{Dynamics, DynamicsConfig, RunError, drift_into, kick};
 pub use thermostat::{Csvr, Langevin, NoseHooverChain, Thermostat};

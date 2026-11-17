@@ -374,6 +374,67 @@ fn restart_with_nose_hoover_chain_is_bitwise_identical() {
     assert!(c.meta.thermostat_rng.is_none());
 }
 
+/// E2.7: with the C-rescale barostat, 200 steps equal 100 + restart + 100 bitwise: the cell,
+/// the barostat's random stream and its work travel in the checkpoint. The box does move.
+#[test]
+fn restart_with_c_rescale_barostat_is_bitwise_identical() {
+    let Some(spec) = spec() else { return };
+    let base = restart_base(&spec).replace(
+        "[[providers]]",
+        "[barostat]\nkind = \"c-rescale\"\npressure_bar = 1.0\ntau_ps = 0.5\n\
+         compressibility_per_bar = 2e-4\nevery = 5\n\n[[providers]]",
+    );
+    assert!(base.contains("c-rescale"));
+    let split = assert_restart_is_bitwise("restart-barostat", &spec, &base);
+    let c = ucmd_io::Checkpoint::read(&split.join("out/checkpoint.ucchk")).unwrap();
+    assert!(c.meta.barostat_rng.is_some());
+    assert!(c.meta.barostat_work_kjmol != 0.0);
+    let initial =
+        std::fs::read_to_string(spec.join("fixtures/valid/argon-864/system.json")).unwrap();
+    let v0: serde_json::Value = serde_json::from_str(&initial).unwrap();
+    let l0 = v0["cell_nm"][0][0].as_f64().unwrap();
+    let l = c.state.cell.as_ref().unwrap().rows()[0].x;
+    assert!(
+        (l / l0 - 1.0).abs() > 1e-6,
+        "the box did not change: {l0} → {l}"
+    );
+    let thermo = std::fs::read_to_string(split.join("out/thermo.tsv")).unwrap();
+    let volumes: std::collections::BTreeSet<_> = thermo
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .map(|l| l.split('\t').nth(8).unwrap().to_string())
+        .collect();
+    assert!(
+        volumes.len() > 10,
+        "the thermo table records the changing volume"
+    );
+}
+
+/// E2.7: a barostat takes its temperature from the thermostat, so it needs one.
+#[test]
+fn a_barostat_without_a_thermostat_is_refused() {
+    let Some(spec) = spec() else { return };
+    let base = restart_base(&spec)
+        .replace(
+            "[thermostat]\nkind = \"csvr\"\ntemperature_K = 94.4\ntau_ps = 0.5\n",
+            "",
+        )
+        .replace(
+            "[[providers]]",
+            "[barostat]\nkind = \"c-rescale\"\npressure_bar = 1.0\ntau_ps = 0.5\n\
+             compressibility_per_bar = 2e-4\n\n[[providers]]",
+        );
+    assert!(!base.contains("[thermostat]"));
+    let dir = run_dir("barostat-no-thermostat", &spec, "argon-864", &base);
+    let out = ucmd()
+        .arg("run")
+        .arg(dir.join("run.toml"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("a barostat needs a thermostat"));
+}
+
 /// E2.6: Langevin BAOAB restarts bitwise: the random stream travels in the checkpoint.
 #[test]
 fn restart_with_langevin_baoab_is_bitwise_identical() {

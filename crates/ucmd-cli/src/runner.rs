@@ -26,6 +26,10 @@ pub fn checkpoint_of<P: ForceProvider>(
         .and_then(|t| t.rng())
         .map(serde_json::to_value)
         .transpose()?;
+    let barostat_rng = dynamics
+        .barostat()
+        .map(|b| serde_json::to_value(b.rng()))
+        .transpose()?;
     Ok(Checkpoint {
         meta: CheckpointMeta {
             step: state.step,
@@ -33,6 +37,8 @@ pub fn checkpoint_of<P: ForceProvider>(
             thermostat_work_kjmol: dynamics.thermostat_work(),
             thermostat_rng,
             thermostat_state: dynamics.thermostat_state(),
+            barostat_work_kjmol: dynamics.barostat_work(),
+            barostat_rng,
             ..base.clone()
         },
         state,
@@ -172,6 +178,8 @@ mod tests {
             thermostat_work_kjmol: 0.0,
             thermostat_rng: None,
             thermostat_state: Vec::new(),
+            barostat_work_kjmol: 0.0,
+            barostat_rng: None,
         }
     }
 
