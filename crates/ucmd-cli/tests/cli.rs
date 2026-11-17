@@ -410,6 +410,46 @@ fn restart_with_c_rescale_barostat_is_bitwise_identical() {
     );
 }
 
+/// E2.7: under NPT the conserved quantity H = K + U + P₀V + bath − barostat work stays
+/// constant up to integration error. The energy of each rescaling is booked by the trapezoid
+/// rule; a one-sided estimate let H drift by ±2 kJ/mol/ps here (45 kJ/mol over 20 ps).
+///
+/// Without the LJ tail correction: its pressure is the virial integral beyond the cutoff
+/// (P_tail·V ≈ 2·E_tail), not −dE_tail/dV (= E_tail/V), because pairs cross the cutoff when the
+/// box scales. With it, H follows the volume by design (66 kJ/mol over 10 ps here), as in other
+/// codes; the sampled ensemble uses the virial pressure either way.
+#[test]
+fn the_conserved_energy_holds_under_npt() {
+    let Some(spec) = spec() else { return };
+    let base = restart_base(&spec)
+        .replace("dispersion_correction = true", "dispersion_correction = false")
+        .replace("steps = 25000", "steps = 2500")
+        .replace("every = 10\n", "every = 1\n")
+        .replace(
+            "[[providers]]",
+            "[barostat]\nkind = \"c-rescale\"\npressure_bar = 100.0\ntau_ps = 1.0\n\
+             compressibility_per_bar = 2e-4\nevery = 10\n\n[[providers]]",
+        );
+    let dir = run_dir("npt-conserved", &spec, "argon-864", &base);
+    assert!(ucmd().arg("run").arg(dir.join("run.toml")).status().unwrap().success());
+    let thermo = std::fs::read_to_string(dir.join("out/thermo.tsv")).unwrap();
+    let mut lines = thermo.lines();
+    let names: Vec<&str> = lines.next().unwrap().trim_start_matches("# ").split('\t').collect();
+    let (h, v) = (
+        names.iter().position(|n| *n == "conserved_energy_kjmol").unwrap(),
+        names.iter().position(|n| *n == "volume_nm3").unwrap(),
+    );
+    let rows: Vec<Vec<f64>> = lines
+        .map(|l| l.split('\t').map(|x| x.parse().unwrap()).collect())
+        .collect();
+    let range = |k: usize| {
+        let xs = rows.iter().map(|r| r[k]);
+        xs.clone().fold(f64::MIN, f64::max) - xs.fold(f64::MAX, f64::min)
+    };
+    assert!(range(v) > 0.05, "the volume moves: {}", range(v));
+    assert!(range(h) < 1.0, "H range over 10 ps: {} kJ/mol", range(h));
+}
+
 /// E2.7: a barostat takes its temperature from the thermostat, so it needs one.
 #[test]
 fn a_barostat_without_a_thermostat_is_refused() {

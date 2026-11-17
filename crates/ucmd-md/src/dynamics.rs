@@ -284,16 +284,22 @@ impl<P: ForceProvider> Dynamics<P> {
         // Barostat: scale the drifted positions, the velocities and the cell (E2.7).
         let mut new_cell = None;
         let mut barostat_work = 0.0;
+        let mut d_eps = 0.0;
+        let mut trace_w_before = 0.0;
         if self.barostat_acts_at(self.state.step) {
-            let (cell, work) = self.rescale(dt)?;
+            let (cell, work, d, tw) = self.rescale(dt)?;
             new_cell = Some(cell);
             barostat_work = work;
+            d_eps = d;
+            trace_w_before = tw;
         }
+        // The virial is needed for the barostat's next pressure, and right after a rescaling for
+        // the energy bookkeeping of that move.
         let request = EvalRequest {
             step: next_step,
             time_ps: self.state.time_ps + dt,
             need_energy,
-            need_virial: (need_virial || self.barostat_acts_at(next_step))
+            need_virial: (need_virial || new_cell.is_some() || self.barostat_acts_at(next_step))
                 && self.provider.capabilities().virial,
         };
         let cell = new_cell.as_ref().or(self.state.cell.as_ref());
@@ -315,6 +321,18 @@ impl<P: ForceProvider> Dynamics<P> {
         if self.config.remove_com_every > 0 && next_step % self.config.remove_com_every == 0 {
             remove_com_velocity(&mut self.spare_velocities, &self.masses);
         }
+        if new_cell.is_some() {
+            // ΔU of the rescaling by the trapezoid rule, −½(tr W_before + tr W_after)·dε/3, with
+            // the virial before (start of the step) and after the move (the rescaled
+            // configuration). Either end alone misses ½(dε/3)²·∂²U/∂e², which the stiff bonds
+            // of molecules make large: in a 7036-atom electrolyte H drifted by +88 or −97
+            // kJ/mol/ps on the same trajectory; the two errors cancel in the mean.
+            let w = self.next_forces.virial.ok_or_else(|| {
+                RunError::Setup("barostat: the provider returned no virial".into())
+            })?;
+            let trace_w_after = w.x_axis.x + w.y_axis.y + w.z_axis.z;
+            barostat_work += -0.5 * (trace_w_before + trace_w_after) * d_eps / 3.0;
+        }
         std::mem::swap(&mut self.state.positions, &mut self.spare_positions);
         std::mem::swap(&mut self.state.velocities, &mut self.spare_velocities);
         std::mem::swap(&mut self.forces, &mut self.next_forces);
@@ -328,10 +346,10 @@ impl<P: ForceProvider> Dynamics<P> {
         Ok(())
     }
 
-    /// One C-rescale move: scale the spare positions and velocities, and return the scaled cell
-    /// and the energy the move puts into K + U + P₀V (kJ/mol). The change of U is the
-    /// first-order estimate −tr(W)·dε/3 from the virial of the state at the start of the step.
-    fn rescale(&mut self, dt: f64) -> Result<(ucmd_core::Cell, f64), RunError> {
+    /// One C-rescale move: scale the spare positions and velocities. Returns the scaled cell,
+    /// the energy the move puts into K + P₀V (kJ/mol), dε, and tr W of the state at the start
+    /// of the step; the change of U is added after the force evaluation (trapezoid rule).
+    fn rescale(&mut self, dt: f64) -> Result<(ucmd_core::Cell, f64, f64, f64), RunError> {
         let setup = |m: &str| RunError::Setup(m.to_string());
         let cell = self
             .state
@@ -360,10 +378,9 @@ impl<P: ForceProvider> Dynamics<P> {
         self.spare_positions.iter_mut().for_each(|x| *x *= mu);
         self.spare_velocities.iter_mut().for_each(|v| *v /= mu);
         let k_after = kinetic_energy(&self.spare_velocities, &self.masses);
+        let work = (k_after - k_before) + p0 * (new_cell.volume() - volume);
         let trace_w = virial.x_axis.x + virial.y_axis.y + virial.z_axis.z;
-        let du = -trace_w * d_eps / 3.0;
-        let work = (k_after - k_before) + du + p0 * (new_cell.volume() - volume);
-        Ok((new_cell, work))
+        Ok((new_cell, work, d_eps, trace_w))
     }
 
     /// Run `steps` steps, calling `observe` after each completed step.

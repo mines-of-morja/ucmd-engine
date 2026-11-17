@@ -43,6 +43,26 @@
 - **Restart:** 200 steps = 100 + restart + 100 steps bitwise, with the box changing.
 - **Refusals:** a barostat without a thermostat, or without a periodic cell and virial.
 
+## The conserved quantity under NPT
+
+- H = K + U + P₀V + bath − barostat work. The energy of each rescaling, ΔU, is estimated from
+  the virial.
+- **First version (475f31c):** ΔU from the virial at the start of the step only. H drifted:
+  - argon: +2.2 kJ/mol/ps, 45 kJ/mol over 20 ps;
+  - the 7036-atom electrolyte: +88 kJ/mol/ps.
+- **Using the virial after the move alone** gave the mirror image on the identical trajectory:
+  −2.2 and −97 kJ/mol/ps. Either end alone misses ½(dε/3)²·∂²U/∂e², which the stiff bonds of
+  molecules make large.
+- **The trapezoid rule** (mean of both virials) cancels it:
+  - argon: 0.00 kJ/mol/ps, H range 0.1 kJ/mol over 20 ps;
+  - electrolyte: −4.2 kJ/mol/ps over 0.5–3 ps, the NVT level after a minimization.
+- The trajectory is bitwise the same in all three versions (checked: T, P, V and U identical),
+  so the densities above are unaffected.
+- **With the LJ tail correction,** H cannot be exactly conserved under a changing volume. The
+  tail pressure is the virial integral (P_tail·V ≈ 2·E_tail), not −dE_tail/dV = E_tail/V,
+  because pairs cross the cutoff. The CLI test `the_conserved_energy_holds_under_npt`
+  therefore runs without it.
+
 ## Open
 
 - **Water:** the second half of the criterion (an SPC/Fw box with PME) is not run yet.
