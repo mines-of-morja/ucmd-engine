@@ -422,7 +422,10 @@ fn restart_with_c_rescale_barostat_is_bitwise_identical() {
 fn the_conserved_energy_holds_under_npt() {
     let Some(spec) = spec() else { return };
     let base = restart_base(&spec)
-        .replace("dispersion_correction = true", "dispersion_correction = false")
+        .replace(
+            "dispersion_correction = true",
+            "dispersion_correction = false",
+        )
         .replace("steps = 25000", "steps = 2500")
         .replace("every = 10\n", "every = 1\n")
         .replace(
@@ -431,12 +434,27 @@ fn the_conserved_energy_holds_under_npt() {
              compressibility_per_bar = 2e-4\nevery = 10\n\n[[providers]]",
         );
     let dir = run_dir("npt-conserved", &spec, "argon-864", &base);
-    assert!(ucmd().arg("run").arg(dir.join("run.toml")).status().unwrap().success());
+    assert!(
+        ucmd()
+            .arg("run")
+            .arg(dir.join("run.toml"))
+            .status()
+            .unwrap()
+            .success()
+    );
     let thermo = std::fs::read_to_string(dir.join("out/thermo.tsv")).unwrap();
     let mut lines = thermo.lines();
-    let names: Vec<&str> = lines.next().unwrap().trim_start_matches("# ").split('\t').collect();
+    let names: Vec<&str> = lines
+        .next()
+        .unwrap()
+        .trim_start_matches("# ")
+        .split('\t')
+        .collect();
     let (h, v) = (
-        names.iter().position(|n| *n == "conserved_energy_kjmol").unwrap(),
+        names
+            .iter()
+            .position(|n| *n == "conserved_energy_kjmol")
+            .unwrap(),
         names.iter().position(|n| *n == "volume_nm3").unwrap(),
     );
     let rows: Vec<Vec<f64>> = lines
