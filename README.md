@@ -62,7 +62,7 @@ The number of threads comes from the machine profile (`threads`, default all log
 | `ucmd-force` | `ForceProvider` contract, result guard, composite provider, observers, provider test kit |
 | `ucmd-providers-classical` | harmonic, Lennard-Jones, neighbour lists, bonded terms, nonbonded with Ewald and PME, the `force-field` provider |
 | `ucmd-providers-ipi` | out-of-process providers over the i-PI socket protocol (E3) |
-| `ucmd-providers-ff` | the `ucmd-ff` provider: adapter to the external ucmd-ff library (own repository, sibling checkout `../ucmd-ff`) |
+| `ucmd-providers-ff` | the `ucmd-ff` provider: adapter to the external ucmd-ff library (own repository, pinned by tag in `Cargo.toml`) |
 | `ucmd-md` | velocity Verlet as operators, CSVR, Nosé–Hoover chains, Langevin BAOAB, FIRE, kinetics, Maxwell–Boltzmann velocities, run loop |
 | `ucmd-io` | package and run-config readers, NPY, thermo/XYZ/H5MD writers, H5MD reader, checkpoints |
 | `ucmd-cli` | the `ucmd` binary; the only crate that knows the concrete providers |

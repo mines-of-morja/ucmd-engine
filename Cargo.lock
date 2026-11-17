@@ -1122,6 +1122,7 @@ dependencies = [
 [[package]]
 name = "ucmd-ff"
 version = "0.1.0"
+source = "git+https://github.com/mines-of-morja/ucmd-ff?tag=v0.1.0#18ed8709b415f67644efdde7ef5df46c5509d1f5"
 
 [[package]]
 name = "ucmd-force"

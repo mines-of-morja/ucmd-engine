@@ -21,8 +21,9 @@ ucmd-providers-ipi = { path = "crates/ucmd-providers-ipi" }
 ucmd-providers-ff = { path = "crates/ucmd-providers-ff" }
 
 # ucmd-ff, the separately developed force-field engine behind the provider kind "ucmd-ff",
-# lives in its own repository (sibling checkout ../ucmd-ff in the UnitcellMD workspace).
-ucmd-ff = { path = "../ucmd-ff" }
+# lives in its own repository. A tag, never a moving branch; it moves in a deliberate update.
+# For local work on both repos, override it with a [patch] to the sibling checkout ../ucmd-ff.
+ucmd-ff = { git = "https://github.com/mines-of-morja/ucmd-ff", tag = "v0.1.0" }
 
 # External crates (versions checked 2026-11-12, docs/design/E1.md §1)
 glam = "0.34"
