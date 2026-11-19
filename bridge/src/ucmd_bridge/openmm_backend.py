@@ -462,6 +462,51 @@ def run(args: argparse.Namespace) -> int:
     return status
 
 
+def probe(args: argparse.Namespace) -> int:
+    """A short test run on the device: does it compute, and how fast? Exit 0 when it worked.
+
+    Used before long GPU jobs. On 2026-11-18/19 the Radeon VII's compute queue stopped
+    answering while a game started on the other card; a probe with a time limit (e.g.
+    `timeout 300`) tells that apart from a slow run.
+    """
+    import openmm as mm
+
+    n_side, spacing = 16, 0.38  # 4096 LJ particles on a lattice, roughly liquid argon
+    box = n_side * spacing
+    system = mm.System()
+    system.setDefaultPeriodicBoxVectors(mm.Vec3(box, 0, 0), mm.Vec3(0, box, 0), mm.Vec3(0, 0, box))
+    lj = mm.NonbondedForce()
+    lj.setNonbondedMethod(mm.NonbondedForce.CutoffPeriodic)
+    lj.setCutoffDistance(1.0)
+    positions = []
+    for i in range(n_side):
+        for j in range(n_side):
+            for k in range(n_side):
+                system.addParticle(39.948)
+                lj.addParticle(0.0, 0.34, 0.996)
+                positions.append(mm.Vec3(i, j, k) * spacing)
+    system.addForce(lj)
+    integrator = mm.VerletIntegrator(0.002)
+    platform = mm.Platform.getPlatformByName(args.platform)
+    properties = {"Precision": args.precision} if args.platform in ("OpenCL", "CUDA", "HIP") else {}
+    if args.device is not None and properties:
+        properties["DeviceIndex"] = args.device
+    context = mm.Context(system, integrator, platform, properties)
+    context.setPositions(positions)
+    context.setVelocitiesToTemperature(100.0, 1)
+    t0 = time.perf_counter()
+    integrator.step(args.steps)
+    energy = context.getState(getEnergy=True).getPotentialEnergy()._value
+    seconds = time.perf_counter() - t0
+    device = ""
+    with contextlib.suppress(Exception):
+        device = context.getPlatform().getPropertyValue(context, "DeviceName")
+    ok = math.isfinite(energy)
+    print(json.dumps({"ok": ok, "platform": args.platform, "device": device,
+                      "steps": args.steps, "seconds": round(seconds, 3)}))  # fmt: skip
+    return 0 if ok else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="ucmd-openmm", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)  # fmt: skip
@@ -481,7 +526,14 @@ def main(argv: list[str] | None = None) -> int:
         default=500,
         help="steps between pressure evaluations (each costs ~2 force evaluations)",
     )
+    q = sub.add_parser("probe", help="a short test run on the device (health check)")
+    q.add_argument("--platform", default="OpenCL")
+    q.add_argument("--precision", default="mixed", choices=["double", "mixed", "single"])
+    q.add_argument("--device")
+    q.add_argument("--steps", type=int, default=2000)
     args = ap.parse_args(argv)
+    if args.command == "probe":
+        return probe(args)
     try:
         return run(args)
     except (ConfigError, ModelError, FileNotFoundError, KeyError) as exc:

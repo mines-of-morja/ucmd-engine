@@ -21,6 +21,13 @@ done
 for dir in "$WORKSPACE" "$PWD" ${UCMD_OPENMM_MOUNTS:-}; do
   args+=(-v "$dir:$dir")
 done
+# A named container, and a reaper that removes it once this process ($$, the docker client after
+# exec) is gone however it ended: a SIGKILLed client leaves its container running otherwise,
+# still holding the GPU (seen 2026-11-19 after the watchdog ended a hung run).
+NAME="ucmd-openmm-$$-$(date +%s)"
+args+=(--name "$NAME")
+setsid bash -c "while kill -0 $$ 2>/dev/null; do sleep 5; done; docker rm -f $NAME" \
+  < /dev/null > /dev/null 2>&1 &
 # ADR 0012: the run records which image it ran in
 args+=(-e "UCMD_OPENMM_IMAGE=$IMAGE" -e "UCMD_OPENMM_IMAGE_ID=$(docker image inspect -f '{{.Id}}' "$IMAGE")")
 exec docker run "${args[@]}" -w "$PWD" --user "$(id -u):$(id -g)" -e HOME=/tmp \

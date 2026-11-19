@@ -244,3 +244,12 @@ def test_mixed_precision_needs_a_thermostat(tmp_path: Path) -> None:
     profile.write_text(profile.read_text() + 'precision = "mixed"\n')
     r = ucmd(tmp_path, profile)
     assert r.returncode == 2 and "ADR 0012" in r.stderr
+
+
+def test_probe_runs_a_short_job() -> None:
+    import json as _json
+
+    r = subprocess.run([str(BRIDGE_EXE), "probe", "--platform", "Reference", "--steps", "5"],
+                       capture_output=True, text=True)  # fmt: skip
+    assert r.returncode == 0, r.stderr
+    assert _json.loads(r.stdout)["ok"] is True
