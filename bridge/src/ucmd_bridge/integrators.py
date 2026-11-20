@@ -38,12 +38,33 @@ def _kick(integ: mm.CustomIntegrator, fraction: float) -> None:
     integ.addComputePerDof("v", f"v + {fraction}*dt*f/m")
 
 
-def velocity_verlet(dt_ps: float) -> mm.CustomIntegrator:
+def _drift(integ: mm.CustomIntegrator, constraints: bool) -> None:
+    """x += dt·v; with constraints RATTLE's position stage: onto the constraints, and the velocity
+    corrected by the displacement over dt (as the engine's SHAKE step, E2.5)."""
+    if not constraints:
+        integ.addComputePerDof("x", "x + dt*v")
+        return
+    integ.addComputePerDof("x", "x + dt*v")
+    integ.addComputePerDof("x1", "x")
+    integ.addConstrainPositions()
+    integ.addComputePerDof("v", "v + (x - x1)/dt")
+
+
+def _new(dt_ps: float, constraints: bool) -> mm.CustomIntegrator:
     integ = mm.CustomIntegrator(dt_ps)
+    if constraints:
+        integ.addPerDofVariable("x1", 0.0)
+    return integ
+
+
+def velocity_verlet(dt_ps: float, constraints: bool = False) -> mm.CustomIntegrator:
+    integ = _new(dt_ps, constraints)
     _start(integ)
     _kick(integ, 0.5)
-    integ.addComputePerDof("x", "x + dt*v")
+    _drift(integ, constraints)
     _kick(integ, 0.5)
+    if constraints:
+        integ.addConstrainVelocities()
     return integ
 
 
@@ -80,10 +101,10 @@ def _chain(integ: mm.CustomIntegrator, m: int, half_dt_fraction: float) -> None:
 
 
 def nose_hoover_chain(dt_ps: float, temperature_k: float, tau_ps: float, chain_length: int,
-                      dof: float) -> mm.CustomIntegrator:  # fmt: skip
+                      dof: float, constraints: bool = False) -> mm.CustomIntegrator:  # fmt: skip
     m = max(1, chain_length)
     kt = BOLTZMANN_KJMOL_K * temperature_k
-    integ = mm.CustomIntegrator(dt_ps)
+    integ = _new(dt_ps, constraints)
     integ.addGlobalVariable("kT", kt)
     integ.addGlobalVariable("dof", dof)
     integ.addGlobalVariable("q1", dof * kt * tau_ps**2)
@@ -96,9 +117,11 @@ def nose_hoover_chain(dt_ps: float, temperature_k: float, tau_ps: float, chain_l
     _start(integ)
     _chain(integ, m, 0.5)
     _kick(integ, 0.5)
-    integ.addComputePerDof("x", "x + dt*v")
+    _drift(integ, constraints)
     _kick(integ, 0.5)
     _chain(integ, m, 0.5)
+    if constraints:
+        integ.addConstrainVelocities()
     return integ
 
 

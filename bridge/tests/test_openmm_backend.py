@@ -7,6 +7,7 @@ which checks conformance, runs, writes spec outputs and restarts. Needs the `ucm
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import signal
@@ -295,3 +296,109 @@ def test_the_emergency_checkpoint_holds_the_last_good_state(tmp_path: Path) -> N
         steps = fh["particles/all/position/step"][()].tolist()
     assert meta["step"] == steps[-1]
     assert meta["identity_molecule_slots"] == list(range(864))
+
+
+RIGID_WATER = """\
+spec_version = "0.1.0"
+system = "system.ucsys"
+
+[run]
+integrator = "velocity-verlet"
+timestep_fs = 1.0
+steps = 2000
+seed = 1
+
+[[providers]]
+kind = "force-field"
+coulomb = "direct"
+
+[output]
+directory = "{out}"
+
+[output.thermo]
+file = "thermo.tsv"
+every = 10
+
+[output.trajectory]
+file = "trajectory.h5"
+every = 100
+"""
+
+
+def _rigid_water(tmp: Path) -> np.ndarray:
+    """water-2 held rigid at the SPC/Fw equilibrium geometry (three distances per molecule), with
+    both molecules placed exactly on it and fixed velocities, so both backends start alike."""
+    pkg = tmp / "system.ucsys"
+    doc = json.loads((pkg / "system.json").read_text())
+    r_oh, theta = 0.1012, np.radians(113.24)
+    r_hh = 2 * r_oh * np.sin(theta / 2)
+    doc["molecule_types"]["SPCFw"]["constraints"] = [
+        {"atoms": [0, 1], "length_nm": r_oh},
+        {"atoms": [0, 2], "length_nm": r_oh},
+        {"atoms": [1, 2], "length_nm": r_hh},
+    ]
+    (pkg / "system.json").write_text(json.dumps(doc))
+    h = theta / 2
+    x = []
+    for o, flip in ((np.zeros(3), 1.0), (np.array([0.5, 0.1, 0.0]), -1.0)):
+        x += [
+            o,
+            o + np.array([r_oh * np.sin(h), flip * r_oh * np.cos(h), 0.0]),
+            o + np.array([-r_oh * np.sin(h), flip * r_oh * np.cos(h), 0.0]),
+        ]
+    np.save(pkg / "positions.npy", np.array(x))
+    rng = np.random.default_rng(5)
+    np.save(pkg / "velocities.npy", rng.normal(0.0, 0.5, (6, 3)))
+    return np.array(
+        [[0, 1, r_oh], [0, 2, r_oh], [1, 2, r_hh], [3, 4, r_oh], [3, 5, r_oh], [4, 5, r_hh]]
+    )
+
+
+def test_constraints_run_on_openmm_like_the_reference_backend(tmp_path: Path) -> None:
+    """E2.5 step 3: OpenMM gets the constraints (RATTLE in the CustomIntegrator). From the same
+    start the two backends agree at first, and OpenMM keeps the constraints and the energy."""
+    import h5py
+
+    profile = setup_run(tmp_path, "water-2", RIGID_WATER.format(out="out"))
+    pairs = _rigid_water(tmp_path)
+    r = ucmd(tmp_path, profile)
+    assert r.returncode == 0, r.stderr
+    (tmp_path / "run.toml").write_text(RIGID_WATER.format(out="cpu"))
+    cpu_profile = tmp_path / "cpu.toml"
+    cpu_profile.write_text("threads = 1\n")
+    c = ucmd(tmp_path, cpu_profile)
+    assert c.returncode == 0, c.stderr
+    names, gpu = thermo(tmp_path)
+    cpu = np.loadtxt(tmp_path / "cpu/thermo.tsv", ndmin=2)
+    u, e = names.index("potential_kjmol"), names.index("total_kjmol")
+    early = slice(0, 21)  # the first 200 fs
+    diff = np.abs(gpu[early, u] - cpu[early, u]).max()
+    exchanged = np.ptp(gpu[:, u])
+    spread = np.ptp(gpu[:, e])
+    print(
+        f"rigid water: |ΔU| over 200 fs {diff:.2e}, exchanged {exchanged:.2f}, spread {spread:.2e}"
+    )
+    assert diff < 1e-6
+    assert exchanged > 1.0 and spread < 0.01 * exchanged
+    with h5py.File(tmp_path / "out/trajectory.h5") as fh:
+        x = fh["particles/all/position/value"][()]
+        assert "RATTLE" in fh["parameters/ucmd/backend"].attrs["constraints"]
+    i, j, d = pairs[:, 0].astype(int), pairs[:, 1].astype(int), pairs[:, 2]
+    r = np.linalg.norm(x[:, i] - x[:, j], axis=-1)
+    # OpenMM holds the constraint lengths in single precision (it found 2026-11-20: every
+    # distance short by exactly float32(d) − d, −5.4e-9 for O–H, −2.7e-8 for H–H). To that
+    # length the tolerance holds; against the package length the error is below 1e-7.
+    d32 = d.astype(np.float32).astype(np.float64)
+    assert (np.abs(r - d32) / d).max() < 1e-9
+    assert (np.abs(r - d) / d).max() < 1e-7
+
+
+def test_constraints_with_langevin_are_refused_on_openmm(tmp_path: Path) -> None:
+    text = RIGID_WATER.format(out="out").replace(
+        'integrator = "velocity-verlet"', 'integrator = "langevin-baoab"'
+    )
+    text += '\n[thermostat]\nkind = "langevin"\ntemperature_K = 300.0\nfriction_per_ps = 1.0\n'
+    profile = setup_run(tmp_path, "water-2", text)
+    _rigid_water(tmp_path)
+    r = ucmd(tmp_path, profile)
+    assert r.returncode != 0 and "E_UNSUPPORTED" in r.stderr + r.stdout

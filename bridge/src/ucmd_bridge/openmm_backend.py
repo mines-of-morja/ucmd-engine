@@ -93,6 +93,25 @@ class Plan:
         return hashlib.sha256(json.dumps(doc, sort_keys=True).encode()).hexdigest()
 
 
+def check_constraint_start(top: Topology) -> None:
+    """As the reference backend (E2.5 design §2): start positions more than 1 % off a constraint
+    length mean the package geometry does not fit its constraints."""
+    x = np.asarray(top.positions_nm)
+    worst = 0.0
+    for i, j, length in top.constraints:
+        d = x[i] - x[j]
+        if top.cell_nm is not None:
+            cell = np.asarray(top.cell_nm)
+            s = d @ np.linalg.inv(cell)
+            d = (s - np.round(s)) @ cell
+        worst = max(worst, abs(float(np.linalg.norm(d)) - length) / length)
+    if worst > 0.01:
+        raise ConfigError(
+            f"the start positions miss the constraints by up to {100 * worst:.1f} % of a "
+            "constraint length; the package geometry does not fit its constraints"
+        )
+
+
 def read_plan(run_toml: Path) -> Plan:
     with run_toml.open("rb") as fh:
         raw = tomllib.load(fh)
@@ -264,17 +283,26 @@ def run(args: argparse.Namespace) -> int:
     com_removed = not (langevin and plan.remove_com_every == 0)
     dof = 3 * top.n_atoms - len(top.constraints) - (3 if com_removed else 0)
     chain = int(plan.thermostat.get("chain_length", 3)) if kind == "nose-hoover-chain" else 0
-    if top.constraints:
-        raise ConfigError("constraints are not implemented in the OpenMM backend's integrators")
+    constrained = bool(top.constraints)
+    if constrained and langevin:
+        raise ConfigError(
+            "E_UNSUPPORTED  constraints with Langevin BAOAB are not implemented yet (E2.5), as in "
+            "the reference backend"
+        )
+    if constrained:
+        check_constraint_start(top)
     if kind == "nose-hoover-chain":
         tau = float(plan.thermostat["tau_ps"])
-        integrator = nose_hoover_chain(plan.dt_ps, temperature, tau, chain, dof)
+        integrator = nose_hoover_chain(plan.dt_ps, temperature, tau, chain, dof, constrained)
     elif langevin:
         friction = float(plan.thermostat["friction_per_ps"])
         integrator = langevin_baoab(plan.dt_ps, temperature, friction)
         integrator.setRandomNumberSeed(plan.seed % 2**31)
     else:
-        integrator = velocity_verlet(plan.dt_ps)
+        integrator = velocity_verlet(plan.dt_ps, constrained)
+    # RATTLE tolerance as the engine (1e-10 relative); single-precision positions cannot reach it
+    constraint_tolerance = 1e-10 if args.precision == "double" else 1e-6
+    integrator.setConstraintTolerance(constraint_tolerance)
 
     if args.precision != "double" and plan.thermostat is None:
         raise ConfigError(
@@ -325,6 +353,9 @@ def run(args: argparse.Namespace) -> int:
                 context.setVelocities(v)
         elif top.velocities_nm_ps is not None:
             context.setVelocities(top.velocities_nm_ps)
+        if constrained:  # the start on the constraints, as the reference backend (E2.5)
+            context.applyConstraints(constraint_tolerance)
+            context.applyVelocityConstraints(constraint_tolerance)
         context.setStepCount(0)
         context.setTime(0.0)
     step = context.getStepCount()
@@ -348,6 +379,10 @@ def run(args: argparse.Namespace) -> int:
             "electrostatics": json.dumps(electrostatics),
             "barostat": "MonteCarloBarostat" if plan.barostat else "none",
             "pressure": "molecular, MonteCarloBarostat.computeCurrentPressure",
+            "constraints": f"{len(top.constraints)}, RATTLE in the CustomIntegrator, relative "
+            f"tolerance {constraint_tolerance:g}"
+            if constrained
+            else "none",
             "identity_tracking": f"positions read every {TRACK_EVERY_STEPS} steps; molecules "
             f"matched by atom RMSD, limit {DEFAULT_MAX_MOVE_NM} nm (identity.py)",
             **environment(),
