@@ -762,3 +762,39 @@ fn the_pressure_tensor_columns_add_up_to_the_pressure() {
     let text = String::from_utf8_lossy(&out.stdout) + String::from_utf8_lossy(&out.stderr);
     assert!(text.contains("E_INCOMPATIBLE"), "{text}");
 }
+
+/// Until E2.5 the reference backend refuses packages with model constraints instead of running
+/// them with free constrained bonds (found 2026-11-20: such a run went through silently).
+#[test]
+fn packages_with_constraints_are_refused_until_e25() {
+    let Some(spec) = spec() else { return };
+    let dir = run_dir(
+        "constraints_refused",
+        &spec,
+        "water-2",
+        "spec_version = \"0.1.0\"\nsystem = \"system.ucsys\"\n\n[run]\nintegrator = \"velocity-verlet\"\n\
+         timestep_fs = 0.5\nsteps = 10\nseed = 1\n\n[[providers]]\nkind = \"force-field\"\n\
+         coulomb = \"direct\"\n",
+    );
+    let path = dir.join("system.ucsys/system.json");
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    doc["molecule_types"]["SPCFw"]["constraints"] =
+        serde_json::json!([{"atoms": [0, 1], "length_nm": 0.1012}]);
+    std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+    for args in [vec!["run"], vec!["minimize", "--out", "min.ucsys"]] {
+        let out = ucmd()
+            .args(&args)
+            .arg(dir.join("run.toml"))
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{args:?} accepted constraints");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("E_UNSUPPORTED"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert!(!dir.join("out/t.tsv").exists() && !dir.join("min.ucsys").exists());
+}

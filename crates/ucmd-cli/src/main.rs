@@ -270,11 +270,26 @@ fn singlepoint(run_toml: &Path, forces_out: Option<&Path>) -> Result<()> {
 }
 
 /// Initial velocities and momentum handling of spec/run-config.md (`[velocities]`, `[momentum]`).
+/// The reference backend does not enforce model constraints yet (E2.5). Without this check a
+/// package with constraints would run with the reduced degrees of freedom but free constrained
+/// bonds (which have no bond term): wrong dynamics and a wrong temperature, silently.
+fn refuse_constraints(system: &ucmd_core::System) -> Result<()> {
+    let n = system.n_constraints();
+    if n > 0 {
+        bail!(
+            "E_UNSUPPORTED  the package has {n} model constraints; the reference backend does not \
+             enforce constraints yet (E2.5)"
+        );
+    }
+    Ok(())
+}
+
 fn minimize(run_toml: &Path, out: &Path, max_force: f64, max_steps: u64) -> Result<()> {
     if out.exists() {
         bail!("{} exists; choose a new directory", out.display());
     }
     let s = setup(run_toml)?;
+    refuse_constraints(&s.package.system)?;
     let state = &s.package.state;
     let mut provider = Guarded::new(registry::make_providers(&s.config, state)?);
     provider
@@ -573,6 +588,7 @@ fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
         return run_external_backend(&s, run_toml, restart, force, b);
     }
     let system = &s.package.system;
+    refuse_constraints(system)?;
     let checkpoint = restart
         .map(ucmd_io::Checkpoint::read)
         .transpose()
