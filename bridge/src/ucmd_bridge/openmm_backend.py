@@ -41,6 +41,7 @@ from pathlib import Path
 import numpy as np
 
 from . import __version__
+from .identity import DEFAULT_MAX_MOVE_NM, Tracker
 from .integrators import bath_energy, langevin_baoab, nose_hoover_chain, velocity_verlet
 from .model import ModelError, NonbondedSettings, build_system
 from .package import ATOMIC_NUMBER, Topology
@@ -54,6 +55,9 @@ MAGIC = b"UCMDOMM1\n"
 # mixed precision itself is admitted by a statistical comparison with double precision.
 FORCE_TOLERANCE = {"double": None, "mixed": 2e-4, "single": 2e-4}
 SYMBOL = {z: s for s, z in ATOMIC_NUMBER.items()}
+# Molecule identity (identity.py): positions are read at least this often, OpenMM's reorder
+# interval, so at most one reorder lies between two reads and molecules move ≪ 0.2 nm.
+TRACK_EVERY_STEPS = 250
 
 
 class ConfigError(ValueError):
@@ -290,6 +294,7 @@ def run(args: argparse.Namespace) -> int:
 
     # start state
     restart_step = None
+    restart_slots = None
     if args.restart:
         meta, blob = read_checkpoint(Path(args.restart))
         if meta["system_sha256"] != top.system_sha256 and not args.force:
@@ -298,6 +303,7 @@ def run(args: argparse.Namespace) -> int:
             raise ConfigError("E_RESTART_MISMATCH  the run configuration differs (use --force)")
         context.loadCheckpoint(blob)
         restart_step = int(meta["step"])
+        restart_slots = meta.get("identity_molecule_slots")  # absent in checkpoints before the fix
     else:
         if periodic:
             context.setPeriodicBoxVectors(*(mm.Vec3(*row) for row in top.cell_nm))
@@ -336,6 +342,8 @@ def run(args: argparse.Namespace) -> int:
             "electrostatics": json.dumps(electrostatics),
             "barostat": "MonteCarloBarostat" if plan.barostat else "none",
             "pressure": "molecular, MonteCarloBarostat.computeCurrentPressure",
+            "identity_tracking": f"positions read every {TRACK_EVERY_STEPS} steps; molecules "
+            f"matched by atom RMSD, limit {DEFAULT_MAX_MOVE_NM} nm (identity.py)",
             **environment(),
             **{k: v for k, v in check.items() if isinstance(v, (int, float, str))},
         },
@@ -366,8 +374,14 @@ def run(args: argparse.Namespace) -> int:
     if every["thermo"] and pressure_every % every["thermo"]:
         pressure_every = max(every["thermo"], pressure_every // every["thermo"] * every["thermo"])
 
+    tracker = Tracker(top.molecule_index, list(top.molecule_type), slots=restart_slots)
+    if restart_step is not None:  # seed the labels before the first step (a fresh start does
+        seed = context.getState(getPositions=True, enforcePeriodicBox=False)  # it in observe)
+        tracker.update(np.asarray(seed.getPositions(asNumpy=True).value_in_unit(unit.nanometer)))
+
     def meta() -> dict:
         return {
+            "identity_molecule_slots": tracker.slot.tolist(),
             "step": context.getStepCount(),
             "time_ps": context.getTime().value_in_unit(unit.picosecond),
             "system_sha256": top.system_sha256,
@@ -378,7 +392,8 @@ def run(args: argparse.Namespace) -> int:
         }
 
     def observe(s: int, last_good: list) -> None:
-        need_pos = bool(every["trajectory"]) and s % every["trajectory"] == 0
+        need_traj = bool(every["trajectory"]) and s % every["trajectory"] == 0
+        need_pos = need_traj or s % TRACK_EVERY_STEPS == 0
         state = context.getState(getEnergy=True, getPositions=need_pos, enforcePeriodicBox=False)
         k = state.getKineticEnergy().value_in_unit(unit.kilojoule_per_mole)
         u = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
@@ -409,9 +424,12 @@ def run(args: argparse.Namespace) -> int:
         if thermo and every["thermo"] and s % every["thermo"] == 0:
             thermo.write(row)
         if need_pos:
-            positions = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
-            traj.write(s, t_ps, np.asarray(positions), cell, row)
-            last_good[0] = context.createCheckpoint()  # for an emergency checkpoint
+            raw = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
+            positions = tracker.update(np.asarray(raw))  # canonical order (invariant 4)
+            if need_traj:
+                traj.write(s, t_ps, positions, cell, row)
+                # for an emergency checkpoint: the state and its own step and labels
+                last_good[0] = (meta(), context.createCheckpoint())
         if ckpt_path and every["checkpoint"] and s % every["checkpoint"] == 0 and s > 0:
             write_checkpoint(ckpt_path, meta(), context.createCheckpoint())
 
@@ -429,13 +447,13 @@ def run(args: argparse.Namespace) -> int:
             file=sys.stderr, flush=True,
         )  # fmt: skip
     stop = Stop()
-    last_good = [context.createCheckpoint()]
+    last_good = [(meta(), context.createCheckpoint())]
     first = step
     status = 0
     try:
         if restart_step is None:
             observe(step, last_good)
-        events = [e for e in (*every.values(), pressure_every) if e]
+        events = [e for e in (*every.values(), pressure_every, TRACK_EVERY_STEPS) if e]
         while step < plan.steps and stop.signal is None:
             nxt = min([plan.steps, *((step // e + 1) * e for e in events)])
             integrator.step(nxt - step)
@@ -443,7 +461,7 @@ def run(args: argparse.Namespace) -> int:
             observe(step, last_good)
     except Exception as exc:  # OpenMM reports NaN coordinates etc. as exceptions
         if ckpt_path is not None:
-            write_checkpoint(ckpt_path.with_suffix(".emergency.ucchk"), meta(), last_good[0])
+            write_checkpoint(ckpt_path.with_suffix(".emergency.ucchk"), *last_good[0])
         print(f"error: the OpenMM backend failed after step {step}: {exc}", file=sys.stderr)
         status = 1
     if status == 0 and ckpt_path is not None:

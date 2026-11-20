@@ -24,8 +24,16 @@
   must lie within `ratio` times the distance to the second nearest, and the matches must form a
   permutation. Otherwise `IdentityError`: a wrong label is worse than a stopped run
   (invariant 7).
-- Reads must therefore be frequent against the motion of a molecule. The backend reads every
-  250 steps, OpenMM's reorder interval, so there is at most one reorder between reads.
+- **Strict mode (the backend)** relies on a physical bound:
+  - between reads 0.25 ps apart, no molecule moves more than about 0.1 nm (atom-wise RMSD);
+  - two distinct identical molecules are never closer than about 0.3 nm.
+  - So only molecules that moved more than `max_move_nm` (0.2 nm) are suspects. Only suspects
+    are matched, among themselves (a swap makes both partners suspects).
+  - After relabelling, every molecule must lie within `max_move_nm`, else IdentityError: the
+    reads were too far apart.
+  - The cost scales with the number of suspects, not with the square of the system.
+- The backend reads every 250 steps at most, OpenMM's reorder interval, so there is at most one
+  reorder between reads.
 
 **Units:** positions in nm.
 """
@@ -34,7 +42,8 @@ from __future__ import annotations
 
 import numpy as np
 
-DEFAULT_RATIO = 0.5  # nearest / second-nearest centroid distance above which a match is refused
+DEFAULT_RATIO = 0.5  # nearest / second-nearest distance above which a match is refused
+DEFAULT_MAX_MOVE_NM = 0.2  # strict mode: the largest atom-wise RMSD between two reads
 
 
 class IdentityError(RuntimeError):
@@ -59,7 +68,8 @@ class Tracker:
     """
 
     def __init__(self, molecule_index: np.ndarray, molecule_type: list[str], *,
-                 ratio: float = DEFAULT_RATIO, perm: np.ndarray | None = None) -> None:  # fmt: skip
+                 ratio: float = DEFAULT_RATIO, max_move_nm: float = DEFAULT_MAX_MOVE_NM,
+                 slots: np.ndarray | None = None) -> None:  # fmt: skip
         mol = np.asarray(molecule_index, dtype=np.int64)
         if np.any(np.diff(mol) < 0) or (len(mol) and mol[0] != 0):
             raise ValueError("molecules must be contiguous runs of atoms numbered from 0")
@@ -73,9 +83,10 @@ class Tracker:
             if len(set(self.sizes[ids].tolist())) != 1:
                 raise ValueError(f"molecules of type {name} differ in size")
         self.ratio = ratio
+        self.max_move_nm = max_move_nm
         self.slot = np.arange(len(self.starts))  # canonical molecule m sits in raw slot slot[m]
-        if perm is not None:
-            self.set_perm(np.asarray(perm, dtype=np.int64))
+        if slots is not None:
+            self.set_slots(np.asarray(slots, dtype=np.int64))
         self.previous: np.ndarray | None = None  # canonical positions at the last read
         self.exchanges = 0  # molecules relabelled so far
         self.worst_ratio = 0.0  # largest nearest / second-nearest distance accepted so far
@@ -89,13 +100,15 @@ class Tracker:
         return np.concatenate([np.arange(self.starts[s], self.starts[s] + self.sizes[s])
                                for s in self.slot])  # fmt: skip
 
-    def set_perm(self, perm: np.ndarray) -> None:
-        if perm.shape != (self.n_atoms,):
-            raise ValueError("permutation of the wrong length")
-        slot = np.searchsorted(self.starts, perm[self.starts], side="right") - 1
-        if not np.array_equal(self.perm_of(slot), perm):
-            raise ValueError("not a permutation of whole molecules")
-        self.slot = slot
+    def set_slots(self, slots: np.ndarray) -> None:
+        """Restore the molecule permutation (e.g. from a checkpoint): slots[m] is the raw slot of
+        canonical molecule m. Only exchanges within a type are allowed."""
+        if sorted(slots.tolist()) != list(range(len(self.starts))):
+            raise ValueError("not a permutation of the molecules")
+        for name, ids in self.groups.items():
+            if set(slots[ids].tolist()) != set(ids.tolist()):
+                raise ValueError(f"the permutation moves a molecule of type {name} to another type")
+        self.slot = slots.copy()
 
     def perm_of(self, slot: np.ndarray) -> np.ndarray:
         return np.concatenate([np.arange(self.starts[s], self.starts[s] + self.sizes[s])
@@ -139,27 +152,21 @@ class Tracker:
         if self.previous is None:
             self.previous = raw[self.perm]
             return self.previous.copy()
-        if jump_nm is not None:
-            if self._own(self.previous, raw[self.perm]).max() <= jump_nm:
-                self.previous = raw[self.perm]
-                return self.previous.copy()
-            self.events += 1
+        if jump_nm is None:
+            return self._update_strict(raw)
+        if self._own(self.previous, raw[self.perm]).max() <= jump_nm:
+            self.previous = raw[self.perm]
+            return self.previous.copy()
+        self.events += 1
         new_slot = self.slot.copy()
-        for name, ids in self.groups.items():
+        for ids in self.groups.values():
             slots = self.slot[ids]
             prev = self._molecules(self.previous, ids, ids)  # canonical order
             cur = self._molecules(raw, ids, slots)
             d = self._rmsd(prev, cur, int(self.sizes[ids[0]]))
-            match, ratio = _assign(d) if jump_nm is None else _ratios(d, min_cost_assignment(d))
+            match, ratio = _ratios(d, min_cost_assignment(d))
             bad = ratio > self.ratio
             if np.any(bad):
-                if jump_nm is None:
-                    k = int(np.argmax(ratio))
-                    raise IdentityError(
-                        f"{name}: molecule {int(ids[k])} is ambiguous (nearest / second-nearest "
-                        f"atom RMSD {ratio[k]:.2f} > {self.ratio}); reads are too far apart to "
-                        f"keep molecule identities"
-                    )
                 self.ambiguous += int(bad.sum())
             if np.any(~bad):
                 self.worst_ratio = max(self.worst_ratio, float(ratio[~bad].max()))
@@ -168,12 +175,49 @@ class Tracker:
             new_slot[ids] = slots[match]
         self.slot = new_slot
         canonical = raw[self.perm]
-        if jump_nm is not None:
+        moved = self._own(self.previous, canonical)
+        if moved.max() > jump_nm:
+            raise IdentityError(
+                f"molecule {int(np.argmax(moved))} still moves {moved.max():.2f} nm after "
+                f"relabelling (limit {jump_nm} nm)"
+            )
+        self.previous = canonical
+        return canonical.copy()
+
+    def _update_strict(self, raw: np.ndarray) -> np.ndarray:
+        own = self._own(self.previous, raw[self.perm])
+        suspects = np.flatnonzero(own > self.max_move_nm)
+        if len(suspects):
+            new_slot = self.slot.copy()
+            mtype = np.empty(len(self.starts), dtype=object)
+            for name, ids in self.groups.items():
+                mtype[ids] = name
+            for name in sorted(set(mtype[suspects].tolist())):
+                ids = suspects[mtype[suspects] == name]
+                slots = self.slot[ids]
+                prev = self._molecules(self.previous, ids, ids)
+                cur = self._molecules(raw, ids, slots)
+                match, ratio = _assign(self._rmsd(prev, cur, int(self.sizes[ids[0]])))
+                if np.any(ratio > self.ratio):
+                    k = int(np.argmax(ratio))
+                    raise IdentityError(
+                        f"{name}: molecule {int(ids[k])} is ambiguous (nearest / second-nearest "
+                        f"atom RMSD {ratio[k]:.2f} > {self.ratio}); reads are too far apart to "
+                        f"keep molecule identities"
+                    )
+                if len(ids) > 1:
+                    self.worst_ratio = max(self.worst_ratio, float(ratio.max()))
+                self.exchanges += int((match != np.arange(len(ids))).sum())
+                new_slot[ids] = slots[match]
+            self.slot = new_slot
+        canonical = raw[self.perm]
+        if len(suspects):
             moved = self._own(self.previous, canonical)
-            if moved.max() > jump_nm:
+            if moved.max() > self.max_move_nm:
                 raise IdentityError(
-                    f"molecule {int(np.argmax(moved))} still moves {moved.max():.2f} nm after "
-                    f"relabelling (limit {jump_nm} nm)"
+                    f"molecule {int(np.argmax(moved))} moved {moved.max():.2f} nm between two "
+                    f"reads (limit {self.max_move_nm} nm); reads are too far apart to keep "
+                    f"molecule identities"
                 )
         self.previous = canonical
         return canonical.copy()

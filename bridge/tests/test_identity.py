@@ -77,17 +77,31 @@ def test_reads_too_far_apart_are_an_error() -> None:
         tracker.update(x + rng.normal(0.0, 0.25, (len(TYPES), 3))[mol])
 
 
-def test_two_molecules_at_the_same_place_are_an_error() -> None:
-    rng = np.random.default_rng(3)
+def _two_li(rng: np.random.Generator, gap_nm: float) -> tuple:
     mol, x = _system(rng)
-    a, b = np.flatnonzero(mol == 0), np.flatnonzero(mol == 1)  # two Li, 0.02 nm apart
-    x[b] = x[a] + [0.02, 0.0, 0.0]
+    a, b = np.flatnonzero(mol == 0), np.flatnonzero(mol == 1)
+    x[b] = x[a] + [gap_nm, 0.0, 0.0]  # two Li close together (the lattice keeps others away)
+    return mol, x, a, b
+
+
+def test_a_swap_of_close_neighbours_is_undone() -> None:
+    mol, x, a, b = _two_li(np.random.default_rng(3), 0.35)
+    tracker = Tracker(mol, TYPES)
+    tracker.update(x)
+    y = x + 0.01
+    y[a], y[b] = y[b].copy(), y[a].copy()  # labels exchanged, partners 0.35 nm apart
+    assert np.array_equal(tracker.update(y), x + 0.01)
+    assert tracker.exchanges == 2
+
+
+def test_an_ambiguous_move_between_reads_is_an_error() -> None:
+    mol, x, a, b = _two_li(np.random.default_rng(3), 0.42)
     tracker = Tracker(mol, TYPES)
     tracker.update(x)
     y = x.copy()
-    y[a] += [0.011, 0.0, 0.0]  # 0.011 nm from its old place, 0.009 nm from b's old place
-    y[b] = x[a] + [0.012, 0.0, 0.0]
-    with pytest.raises(IdentityError, match="too far apart"):
+    y[a] = x[a] + [0.62, 0.0, 0.0]  # one Li at 0.20 and one at 0.62 nm along the pair axis:
+    y[b] = x[a] + [0.20, 0.0, 0.0]  # b's old place (0.42) is 0.22 and 0.20 nm from both
+    with pytest.raises(IdentityError, match="ambiguous"):
         tracker.update(y)
 
 
@@ -98,17 +112,19 @@ def test_the_permutation_survives_a_checkpoint() -> None:
     first = Tracker(mol, TYPES)
     first.update(x)
     canonical = first.update(x[p])
-    second = Tracker(mol, TYPES, perm=first.perm)  # as after a restart
+    second = Tracker(mol, TYPES, slots=first.slot)  # as after a restart
     assert np.array_equal(second.update(x[p]), canonical)
 
 
-def test_a_permutation_that_splits_molecules_is_refused() -> None:
+def test_a_wrong_stored_permutation_is_refused() -> None:
     rng = np.random.default_rng(5)
     mol, _ = _system(rng)
-    p = np.arange(len(mol))
-    p[[12, 13]] = p[[13, 12]]  # two atoms of the first PF6 swapped: not a molecule exchange
-    with pytest.raises(ValueError, match="whole molecules"):
-        Tracker(mol, TYPES, perm=p)
+    slots = np.arange(len(TYPES))
+    slots[[11, 12]] = slots[[12, 11]]  # the last Li and the first PF6: different types
+    with pytest.raises(ValueError, match="another type"):
+        Tracker(mol, TYPES, slots=slots)
+    with pytest.raises(ValueError, match="not a permutation"):
+        Tracker(mol, TYPES, slots=np.zeros(len(TYPES), dtype=np.int64))
     with pytest.raises(ValueError, match="differ in size"):
         Tracker(mol, ["Li"] * 13 + ["PF6"] * 11 + ["EC"] * 30)
 

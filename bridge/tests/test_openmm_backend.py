@@ -148,6 +148,13 @@ def test_restart_appends_from_the_checkpoint(tmp_path: Path) -> None:
     with h5py.File(tmp_path / "out/trajectory.h5") as fh:
         assert fh["particles/all/position/step"][()].tolist() == [0, 50, 100, 150, 200]
         assert "restarts" in fh["parameters/ucmd"]
+        assert "identity" in fh["parameters/ucmd/backend"].attrs["identity_tracking"]
+    from ucmd_bridge.openmm_backend import read_checkpoint
+
+    # the molecule labels travel with the state (identity.py); argon: 864 one-atom molecules
+    meta, _blob = read_checkpoint(tmp_path / "out/checkpoint.ucchk")
+    assert meta["step"] == 200
+    assert meta["identity_molecule_slots"] == list(range(864))
 
 
 def test_charged_crystal_with_pme_agrees(tmp_path: Path) -> None:
@@ -253,3 +260,23 @@ def test_probe_runs_a_short_job() -> None:
                        capture_output=True, text=True)  # fmt: skip
     assert r.returncode == 0, r.stderr
     assert _json.loads(r.stdout)["ok"] is True
+
+
+def test_the_emergency_checkpoint_holds_the_last_good_state(tmp_path: Path) -> None:
+    """A provider failure writes the state of the last trajectory frame with that frame's own
+    step and molecule labels, not the step at which the run failed (fixed 2026-11-20)."""
+    text = ARGON.format(steps=2000, thermostat="nose-hoover-chain").replace(
+        "timestep_fs = 4.0", "timestep_fs = 60.0"
+    )  # far beyond stability for argon: the run fails with non-finite numbers
+    profile = setup_run(tmp_path, "argon-864", text)
+    r = ucmd(tmp_path, profile)
+    assert r.returncode != 0
+    import h5py
+
+    from ucmd_bridge.openmm_backend import read_checkpoint
+
+    meta, _blob = read_checkpoint(tmp_path / "out/checkpoint.emergency.ucchk")
+    with h5py.File(tmp_path / "out/trajectory.h5") as fh:
+        steps = fh["particles/all/position/step"][()].tolist()
+    assert meta["step"] == steps[-1]
+    assert meta["identity_molecule_slots"] == list(range(864))
