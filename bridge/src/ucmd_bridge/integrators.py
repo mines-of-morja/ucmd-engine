@@ -135,16 +135,31 @@ def bath_energy(integ: mm.CustomIntegrator, chain_length: int) -> float:
     return kinetic + potential
 
 
+def _half_drift(integ: mm.CustomIntegrator, constraints: bool) -> None:
+    integ.addComputePerDof("x", "x + 0.5*dt*v")
+    if constraints:
+        integ.addComputePerDof("x1", "x")
+        integ.addConstrainPositions()
+        integ.addComputePerDof("v", "v + (x - x1)/(0.5*dt)")
+
+
 def langevin_baoab(
-    dt_ps: float, temperature_k: float, friction_per_ps: float
+    dt_ps: float, temperature_k: float, friction_per_ps: float, constraints: bool = False
 ) -> mm.CustomIntegrator:
-    integ = mm.CustomIntegrator(dt_ps)
+    """BAOAB; with constraints the constrained BAOAB of Leimkuhler & Matthews (2016), as the
+    engine: positions onto the constraints after each half drift, velocities after O and at the
+    end."""
+    integ = _new(dt_ps, constraints)
     integ.addGlobalVariable("kT", BOLTZMANN_KJMOL_K * temperature_k)
     integ.addGlobalVariable("c", math.exp(-friction_per_ps * dt_ps))
     _start(integ)
     _kick(integ, 0.5)
-    integ.addComputePerDof("x", "x + 0.5*dt*v")
+    _half_drift(integ, constraints)
     integ.addComputePerDof("v", "c*v + sqrt((1 - c*c)*kT/m)*gaussian")
-    integ.addComputePerDof("x", "x + 0.5*dt*v")
+    if constraints:
+        integ.addConstrainVelocities()
+    _half_drift(integ, constraints)
     _kick(integ, 0.5)
+    if constraints:
+        integ.addConstrainVelocities()
     return integ

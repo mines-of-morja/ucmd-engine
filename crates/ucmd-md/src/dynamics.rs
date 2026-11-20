@@ -203,12 +203,6 @@ impl<P: ForceProvider> Dynamics<P> {
             return Err(RunError::Setup("time step must be positive".into()));
         }
         let constraints = Constraints::from_system(system);
-        if !constraints.is_empty() && thermostat.as_ref().is_some_and(|t| t.acts_in_the_middle()) {
-            return Err(RunError::Setup(
-                "constraints with Langevin BAOAB are not implemented yet (E2.5, second step)"
-                    .into(),
-            ));
-        }
         let mut provider = Guarded::new(provider);
         provider
             .initialize(system)
@@ -321,23 +315,18 @@ impl<P: ForceProvider> Dynamics<P> {
         Ok(())
     }
 
-    /// Constraint virial of the current state, estimated as in a step: the velocity stage of a
-    /// half kick with the current forces (the velocities themselves are not changed).
+    /// Constraint virial of the current state: the exact instantaneous constraint forces.
     fn constraint_virial_of_current_state(&self) -> Result<ucmd_core::Mat3, RunError> {
         if self.constraints.is_empty() {
             return Ok(ucmd_core::Mat3::ZERO);
         }
-        let mut v = self.state.velocities.clone();
-        let dt_half = 0.5 * self.config.dt_ps;
-        kick(&mut v, &self.forces.forces, &self.inverse_masses, dt_half);
         self.constraints
-            .rattle(
+            .force_virial(
                 &self.state.positions,
-                &mut v,
-                &self.masses,
+                &self.state.velocities,
+                &self.forces.forces,
                 &self.inverse_masses,
                 self.state.cell.as_ref(),
-                dt_half,
             )
             .map_err(|source| RunError::Constraint {
                 step: self.state.step,
@@ -427,11 +416,60 @@ impl<P: ForceProvider> Dynamics<P> {
                 &self.spare_velocities,
                 0.5 * dt,
             );
+            // constrained BAOAB (Leimkuhler & Matthews 2016): S after each A, R after O
+            let constrained = !self.constraints.is_empty();
+            let fail = |source| RunError::Constraint {
+                step: next_step,
+                source,
+            };
+            if constrained {
+                self.constraints
+                    .shake(
+                        &mut self.spare_positions,
+                        &mut self.spare_velocities,
+                        &self.state.positions,
+                        &self.inverse_masses,
+                        self.state.cell.as_ref(),
+                        0.5 * dt,
+                    )
+                    .map_err(fail)?;
+            }
             if let Some(thermostat) = self.thermostat.as_mut() {
                 work += thermostat.apply(&mut self.spare_velocities, &self.masses, self.dof, dt);
             }
+            if constrained {
+                // the noise kicks along the constraints too; that part is removed (no virial: O
+                // is not a force)
+                self.constraints
+                    .rattle(
+                        &self.spare_positions,
+                        &mut self.spare_velocities,
+                        &self.masses,
+                        &self.inverse_masses,
+                        self.state.cell.as_ref(),
+                        0.5 * dt,
+                    )
+                    .map_err(fail)?;
+            }
+            let halfway = if constrained {
+                Some(self.spare_positions.clone())
+            } else {
+                None
+            };
             for (x, v) in self.spare_positions.iter_mut().zip(&self.spare_velocities) {
                 *x += 0.5 * dt * *v;
+            }
+            if let Some(reference) = halfway {
+                self.constraints
+                    .shake(
+                        &mut self.spare_positions,
+                        &mut self.spare_velocities,
+                        &reference,
+                        &self.inverse_masses,
+                        self.state.cell.as_ref(),
+                        0.5 * dt,
+                    )
+                    .map_err(fail)?;
             }
         } else {
             // O(½) B(½) A(1) F B(½) O(½)
@@ -508,12 +546,11 @@ impl<P: ForceProvider> Dynamics<P> {
         if self.config.remove_com_every > 0 && next_step % self.config.remove_com_every == 0 {
             remove_com_velocity(&mut self.spare_velocities, &self.masses);
         }
-        // R: velocities along the constraints removed; their constraint force belongs to the end
-        // of the step and enters its virial (E2.5 design §3)
+        // R: velocities along the constraints removed; the virial of the new state's exact
+        // constraint forces enters its pressure (E2.5 design §3)
         let mut next_constraint_virial = ucmd_core::Mat3::ZERO;
         if !self.constraints.is_empty() {
-            let wc = self
-                .constraints
+            self.constraints
                 .rattle(
                     &self.spare_positions,
                     &mut self.spare_velocities,
@@ -527,9 +564,22 @@ impl<P: ForceProvider> Dynamics<P> {
                     source,
                 })?;
             if let Some(w) = self.next_forces.virial.as_mut() {
+                let wc = self
+                    .constraints
+                    .force_virial(
+                        &self.spare_positions,
+                        &self.spare_velocities,
+                        &self.next_forces.forces,
+                        &self.inverse_masses,
+                        cell,
+                    )
+                    .map_err(|source| RunError::Constraint {
+                        step: next_step,
+                        source,
+                    })?;
                 *w += wc;
+                next_constraint_virial = wc;
             }
-            next_constraint_virial = wc;
         }
         if new_cell.is_some() {
             // ΔU of the rescaling by the trapezoid rule, −½(tr W_before + tr W_after)·dε/3, with
@@ -1615,8 +1665,8 @@ mod tests {
 
     /// An ideal gas of rigid dimers: for a free rigid rotor the centripetal constraint force
     /// cancels the rotational part of the atomic kinetic pressure, so at every step the atomic
-    /// pressure with the constraint virial equals the pressure of the molecular centres of mass,
-    /// up to the O(Δt²) error of the constraint-force estimate.
+    /// pressure with the constraint virial equals the pressure of the molecular centres of mass.
+    /// With the exact instantaneous constraint forces (force_virial) this holds to rounding.
     #[test]
     fn constraint_virial_turns_atomic_into_molecular_pressure() {
         use crate::random::{STREAM_VELOCITIES, stream};
@@ -1692,7 +1742,7 @@ mod tests {
         );
         assert!(worst_violation < 1e-10);
         assert!((sum_atomic / sum_com - 1.0).abs() < 1e-3);
-        assert!(worst_relative < 0.02);
+        assert!(worst_relative < 1e-12);
         // free rotors and free flight: the kinetic energy is conserved
         assert!(((md.kinetic_energy() - k0) / k0).abs() < 1e-3);
     }
@@ -1766,43 +1816,75 @@ mod tests {
         assert!(worst_e / e0.abs() < 1e-3);
     }
 
+    /// Constrained BAOAB samples the canonical ensemble of the constrained system: rigid dimers in
+    /// an ideal gas (Langevin, unlike CSVR, is ergodic for free rotors) have ⟨K⟩ = N_dof k_BT/2
+    /// with N_dof = 6N − N_c, and the atomic pressure with the constraint virial averages to the
+    /// molecular ideal-gas value N k_BT/V (E2.5 step 4).
     #[test]
-    fn langevin_with_constraints_is_refused_for_now() {
-        use crate::barostat::{CRescale, CRescaleConfig};
-        use crate::random::{STREAM_BAROSTAT, STREAM_THERMOSTAT, stream};
+    fn constrained_langevin_samples_equipartition_and_the_ideal_gas_pressure() {
+        use crate::random::{STREAM_THERMOSTAT, STREAM_VELOCITIES, stream};
         use crate::thermostat::Langevin;
-        let system = rigid_system(&[1.0, 1.0], &[(0, 1, 0.1)], 1, [true; 3]);
-        let cell = || {
-            Some(
-                Cell::new(
-                    [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]],
-                    [true; 3],
-                )
-                .unwrap(),
-            )
-        };
-        let x = vec![Vec3::new(1.0, 1.0, 1.0), Vec3::new(1.1, 1.0, 1.0)];
-        let state = || State::new(x.clone(), None, cell());
-        let langevin = Box::new(Langevin::new(300.0, 1.0, stream(1, STREAM_THERMOSTAT)));
-        assert!(matches!(
-            Dynamics::new(&system, IdealGas, state(), DynamicsConfig::nve(0.001), Some(langevin)),
-            Err(RunError::Setup(m)) if m.contains("Langevin")
-        ));
-        let md =
-            Dynamics::new(&system, IdealGas, state(), DynamicsConfig::nve(0.001), None).unwrap();
-        let barostat = CRescale::new(
-            CRescaleConfig {
-                pressure_bar: 1.0,
-                tau_ps: 1.0,
-                compressibility_per_bar: 4.5e-5,
-                every: 10,
-                temperature_k: 300.0,
-            },
-            stream(1, STREAM_BAROSTAT),
+        use ucmd_core::units::{BAR_PER_KJMOL_NM3, BOLTZMANN_KJMOL_K};
+        let (n, d, edge, t) = (64, 0.1, 3.0, 300.0);
+        let system = rigid_system(&[12.0, 16.0], &[(0, 1, d)], n, [true; 3]);
+        let mut rng = stream(41, STREAM_VELOCITIES);
+        let mut x = Vec::new();
+        for k in 0..n {
+            let c = Vec3::new(
+                (k % 4) as f64 * 0.75 + 0.3,
+                ((k / 4) % 4) as f64 * 0.75 + 0.3,
+                (k / 16) as f64 * 0.75 + 0.3,
+            );
+            let u = unit(&mut rng);
+            x.push(c + u * (0.5 * d));
+            x.push(c - u * (0.5 * d));
+        }
+        let cell = Cell::new(
+            [[edge, 0.0, 0.0], [0.0, edge, 0.0], [0.0, 0.0, edge]],
+            [true; 3],
         )
         .unwrap();
-        // since E2.5 step 2 a barostat with constraints is accepted
-        assert!(md.with_barostat(barostat).is_ok());
+        let state = State::new(x, None, Some(cell));
+        let langevin = Box::new(Langevin::new(t, 5.0, stream(42, STREAM_THERMOSTAT)));
+        let config = DynamicsConfig {
+            virial_every_step: true,
+            ..DynamicsConfig::nve(0.002)
+        };
+        let mut md = Dynamics::new(&system, IdealGas, state, config, Some(langevin)).unwrap();
+        let checks = Constraints::from_system(&system);
+        md.run(5000, |_| {}).unwrap();
+        let (mut temps, mut pressures, mut worst) = (Vec::new(), Vec::new(), 0.0f64);
+        md.run(200_000, |m| {
+            temps.push(m.temperature());
+            let p = m.snapshot().pressure_bar.unwrap();
+            pressures.push((p.x_axis.x + p.y_axis.y + p.z_axis.z) / 3.0);
+            worst = worst.max(checks.max_violation(&m.state().positions, m.state().cell.as_ref()));
+        })
+        .unwrap();
+        let block = |v: &[f64]| {
+            let means: Vec<f64> = v
+                .chunks_exact(v.len() / 20)
+                .map(|c| c.iter().sum::<f64>() / c.len() as f64)
+                .collect();
+            let m = means.iter().sum::<f64>() / means.len() as f64;
+            let e = (means.iter().map(|x| (x - m).powi(2)).sum::<f64>()
+                / (means.len() * (means.len() - 1)) as f64)
+                .sqrt();
+            (m, e)
+        };
+        let (tm, te) = block(&temps);
+        let (pm, pe) = block(&pressures);
+        let p_ideal = n as f64 * BOLTZMANN_KJMOL_K * t / edge.powi(3) * BAR_PER_KJMOL_NM3;
+        eprintln!(
+            "constrained Langevin: T {tm:.2} ± {te:.2} K (300), P {pm:.3} ± {pe:.3} bar \
+             (ideal molecular {p_ideal:.3}), violation {worst:.1e}"
+        );
+        assert!(worst <= 1e-10);
+        assert!((tm - t).abs() < 4.0 * te + 0.5, "T {tm} ± {te}");
+        assert!(
+            (pm - p_ideal).abs() < 4.0 * pe + 0.005 * p_ideal,
+            "P {pm} ± {pe} vs {p_ideal}"
+        );
     }
 
     #[test]

@@ -284,11 +284,6 @@ def run(args: argparse.Namespace) -> int:
     dof = 3 * top.n_atoms - len(top.constraints) - (3 if com_removed else 0)
     chain = int(plan.thermostat.get("chain_length", 3)) if kind == "nose-hoover-chain" else 0
     constrained = bool(top.constraints)
-    if constrained and langevin:
-        raise ConfigError(
-            "E_UNSUPPORTED  constraints with Langevin BAOAB are not implemented yet (E2.5), as in "
-            "the reference backend"
-        )
     if constrained:
         check_constraint_start(top)
     if kind == "nose-hoover-chain":
@@ -296,7 +291,7 @@ def run(args: argparse.Namespace) -> int:
         integrator = nose_hoover_chain(plan.dt_ps, temperature, tau, chain, dof, constrained)
     elif langevin:
         friction = float(plan.thermostat["friction_per_ps"])
-        integrator = langevin_baoab(plan.dt_ps, temperature, friction)
+        integrator = langevin_baoab(plan.dt_ps, temperature, friction, constrained)
         integrator.setRandomNumberSeed(plan.seed % 2**31)
     else:
         integrator = velocity_verlet(plan.dt_ps, constrained)

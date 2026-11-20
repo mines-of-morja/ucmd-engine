@@ -12,9 +12,11 @@
 //! anything: a state that already satisfies the constraints is left bit for bit unchanged (restart).
 //! No convergence within the iteration limit is an error naming the constraint (invariant 7).
 //!
-//! The velocity stage also returns the constraint virial W_c = Σ r_ij ⊗ g_ij (units.md §4), with
-//! g_ij = 2 m Δv / dt the constraint force of the final half kick. It belongs to the end of the
-//! step and is added to the provider virial before pressures are formed.
+//! The constraint virial for pressures, W_c = Σ r_ij ⊗ g_ij (units.md §4), comes from
+//! [`Constraints::force_virial`]: the exact instantaneous constraint forces of a state, solved from
+//! d²|r_ij|²/dt² = 0, so it does not depend on the integrator. An estimate from the final velocity
+//! stage was right for velocity Verlet but caught only half the centripetal force in BAOAB, whose
+//! last drift is half a step (pressure 4/3 too high for rigid dimers, found 2026-11-20).
 //!
 //! Units: nm, ps, amu; virial in kJ/mol.
 
@@ -187,6 +189,53 @@ impl Constraints {
             }
         }
         Err(self.failure(x, cell, "velocities"))
+    }
+
+    /// Constraint virial W_c = Σ r_ij ⊗ g_ij (kJ/mol) of a state on the constraints: the exact
+    /// instantaneous constraint forces g = λ r_ij that keep d²|r_ij|²/dt² = 0, i.e.
+    /// |v_ij|² + r_ij·(a_i − a_j) = 0 with a = (F + g)/m, solved by Gauss–Seidel to the relative
+    /// tolerance. `forces` are the provider's forces (kJ/mol/nm), `v` the projected velocities.
+    pub fn force_virial(
+        &self,
+        x: &[Vec3],
+        v: &[Vec3],
+        forces: &[Vec3],
+        inverse_masses: &[f64],
+        cell: Option<&Cell>,
+    ) -> Result<Mat3, ConstraintError> {
+        let mut g = vec![Vec3::ZERO; x.len()];
+        let mut lambda = vec![0.0; self.pairs.len()];
+        for iteration in 0..MAX_ITERATIONS {
+            let mut converged = true;
+            for (k, &(i, j, _)) in self.pairs.iter().enumerate() {
+                let r = separation(cell, x[i], x[j]);
+                let (wi, wj) = (inverse_masses[i], inverse_masses[j]);
+                let vv = (v[i] - v[j]).length_squared();
+                let af = r.dot(forces[i] * wi - forces[j] * wj);
+                let residual = vv + af + r.dot(g[i] * wi - g[j] * wj);
+                if residual.abs() <= self.tolerance * (vv + af.abs() + 1e-30) {
+                    continue;
+                }
+                converged = false;
+                let delta = -residual / ((wi + wj) * r.length_squared());
+                lambda[k] += delta;
+                g[i] += r * delta;
+                g[j] -= r * delta;
+            }
+            if converged {
+                let mut w = Mat3::ZERO;
+                for (k, &(i, j, _)) in self.pairs.iter().enumerate() {
+                    let r = separation(cell, x[i], x[j]);
+                    let f = r * lambda[k];
+                    w += Mat3::from_cols(r * f.x, r * f.y, r * f.z);
+                }
+                return Ok(w);
+            }
+            if iteration + 1 == MAX_ITERATIONS {
+                break;
+            }
+        }
+        Err(self.failure(x, cell, "constraint forces"))
     }
 
     fn failure(&self, x: &[Vec3], cell: Option<&Cell>, stage: &'static str) -> ConstraintError {

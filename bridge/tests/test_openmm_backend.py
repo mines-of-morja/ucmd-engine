@@ -393,12 +393,21 @@ def test_constraints_run_on_openmm_like_the_reference_backend(tmp_path: Path) ->
     assert (np.abs(r - d) / d).max() < 1e-7
 
 
-def test_constraints_with_langevin_are_refused_on_openmm(tmp_path: Path) -> None:
+def test_constraints_with_langevin_run_on_openmm(tmp_path: Path) -> None:
+    """E2.5 step 4: constrained BAOAB in the bridge keeps the constraints (the canonical sampling
+    itself is tested in the engine)."""
+    import h5py
+
     text = RIGID_WATER.format(out="out").replace(
         'integrator = "velocity-verlet"', 'integrator = "langevin-baoab"'
     )
     text += '\n[thermostat]\nkind = "langevin"\ntemperature_K = 300.0\nfriction_per_ps = 1.0\n'
     profile = setup_run(tmp_path, "water-2", text)
-    _rigid_water(tmp_path)
+    pairs = _rigid_water(tmp_path)
     r = ucmd(tmp_path, profile)
-    assert r.returncode != 0 and "E_UNSUPPORTED" in r.stderr + r.stdout
+    assert r.returncode == 0, r.stderr
+    with h5py.File(tmp_path / "out/trajectory.h5") as fh:
+        x = fh["particles/all/position/value"][()]
+    i, j, d = pairs[:, 0].astype(int), pairs[:, 1].astype(int), pairs[:, 2]
+    r_ij = np.linalg.norm(x[:, i] - x[:, j], axis=-1)
+    assert (np.abs(r_ij - d) / d).max() < 1e-7  # single-precision lengths in OpenMM, see above
