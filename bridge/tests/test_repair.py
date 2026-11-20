@@ -11,6 +11,7 @@ import h5py
 import numpy as np
 import pytest
 
+from ucmd_bridge.identity import IdentityError
 from ucmd_bridge.package import load
 from ucmd_bridge.repair import repair
 
@@ -27,6 +28,7 @@ def _write(path: Path, sha: str, frames: np.ndarray) -> None:
         g = fh.create_group("particles/all/position")
         g["value"] = frames.astype(np.float32)
         g["step"] = np.arange(len(frames), dtype=np.int64) * 2000
+        g["time"] = np.arange(len(frames), dtype=np.float64) * 2.0
 
 
 def _trajectory(rng: np.random.Generator, x0: np.ndarray, mol_type: list[str]) -> tuple:
@@ -73,3 +75,22 @@ def test_a_wrong_package_or_an_existing_destination_is_refused(tmp_path: Path) -
     dst.write_bytes(b"")
     with pytest.raises(FileExistsError):
         repair(src, dst, NACL)
+
+
+def test_a_violent_start_can_be_skipped(tmp_path: Path) -> None:
+    """A4 (2026-11-20): a too dense NPT start moved molecules by up to 1.1 nm in the first 2 ps,
+    which the repair cannot tell from a relabelling. --skip-ps starts tracking after it."""
+    top = load(NACL)
+    rng = np.random.default_rng(12)
+    true, written = _trajectory(rng, top.positions_nm, list(top.molecule_type))
+    written[0] = written[0].copy()
+    written[0][0] -= [0.5, 0.0, 0.0]  # frame 0: one ion far from where it is at frame 1
+    src = tmp_path / "trajectory.h5"
+    _write(src, top.system_sha256, written)
+    with pytest.raises(IdentityError):
+        repair(src, tmp_path / "a.h5", NACL, jump_nm=0.1)
+    record = repair(src, tmp_path / "b.h5", NACL, jump_nm=0.1, skip_ps=2.0)
+    assert record["first_tracked_step"] == 2000 and record["events"] == 2
+    with h5py.File(tmp_path / "b.h5", "r") as fh:
+        fixed = fh["particles/all/position/value"][()]
+    assert np.array_equal(fixed[1:], true[1:].astype(np.float32))

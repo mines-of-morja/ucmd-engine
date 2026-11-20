@@ -197,3 +197,20 @@ def test_repair_mode_finds_the_only_consistent_assignment() -> None:
     d = np.array([[0.335, 0.869], [0.326, 0.45]])
     assert _assign(d)[0].tolist() == [1, 0]  # greedy: row 0 gets 0.869 > jump
     assert min_cost_assignment(d).tolist() == [0, 1]
+
+
+def test_strict_mode_accepts_a_fast_but_unambiguous_molecule() -> None:
+    """A violent start moves molecules fast; an unambiguous large move is real motion, not a
+    reason to stop the run (it would stop again at every restart)."""
+    rng = np.random.default_rng(13)
+    mol, x = _system(rng)
+    tracker = Tracker(mol, TYPES)
+    tracker.update(x)
+    y = x.copy()
+    y[mol == 30] += [0.3, 0.0, 0.0]  # 0.3 nm in one read: above max_move, below the limit
+    assert np.array_equal(tracker.update(y), y)
+    assert tracker.exchanges == 0
+    z = y.copy()
+    z[mol == 31] += [0.0, 0.7, 0.0]  # beyond 3 × max_move: impossible in 0.25 ps
+    with pytest.raises(IdentityError, match="too far apart"):
+        tracker.update(z)

@@ -29,8 +29,11 @@
   - two distinct identical molecules are never closer than about 0.3 nm.
   - So only molecules that moved more than `max_move_nm` (0.2 nm) are suspects. Only suspects
     are matched, among themselves (a swap makes both partners suspects).
-  - After relabelling, every molecule must lie within `max_move_nm`, else IdentityError: the
-    reads were too far apart.
+  - After relabelling, a molecule may still have moved more than `max_move_nm` if its match was
+    unambiguous: fast but real motion, e.g. in the violent first picoseconds of a too dense
+    start (A4, 2026-11-20). Only moves beyond `MAX_PHYSICAL_MOVE_FACTOR × max_move_nm`
+    (0.6 nm per read) raise IdentityError. An error there would repeat at every restart from
+    the same checkpoint, so it is kept for the impossible.
   - The cost scales with the number of suspects, not with the square of the system.
 - The backend reads every 250 steps at most, OpenMM's reorder interval, so there is at most one
   reorder between reads.
@@ -43,7 +46,8 @@ from __future__ import annotations
 import numpy as np
 
 DEFAULT_RATIO = 0.5  # nearest / second-nearest distance above which a match is refused
-DEFAULT_MAX_MOVE_NM = 0.2  # strict mode: the largest atom-wise RMSD between two reads
+DEFAULT_MAX_MOVE_NM = 0.2  # strict mode: molecules that moved more between two reads are matched
+MAX_PHYSICAL_MOVE_FACTOR = 3.0  # strict mode: a move beyond 3 × max_move_nm per read is an error
 
 
 class IdentityError(RuntimeError):
@@ -213,11 +217,12 @@ class Tracker:
         canonical = raw[self.perm]
         if len(suspects):
             moved = self._own(self.previous, canonical)
-            if moved.max() > self.max_move_nm:
+            limit = MAX_PHYSICAL_MOVE_FACTOR * self.max_move_nm
+            if moved.max() > limit:
                 raise IdentityError(
                     f"molecule {int(np.argmax(moved))} moved {moved.max():.2f} nm between two "
-                    f"reads (limit {self.max_move_nm} nm); reads are too far apart to keep "
-                    f"molecule identities"
+                    f"reads (limit {limit:.2f} nm); reads are too far apart to keep molecule "
+                    f"identities"
                 )
         self.previous = canonical
         return canonical.copy()

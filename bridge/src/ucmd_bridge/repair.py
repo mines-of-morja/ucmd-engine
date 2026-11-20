@@ -14,6 +14,11 @@
   ambiguous. They are counted, not hidden.
 - `--jump-nm` must lie above every real move between frames. In the pilot no molecule moved
   more than 0.6 nm in 2 ps outside the events.
+- `--skip-ps`: frames before this time are copied unchanged and tracking starts at the first
+  frame after it. For runs whose first picoseconds are violent (a too dense start under NPT
+  moved molecules by up to 1.1 nm in the first 2 ps, A4 2026-11-20); the analysis skips them
+  anyway. The labels then follow the first tracked frame. Identical molecules are
+  interchangeable, so a relabelling before it changes nothing in the analysed window.
 - The package must be the one the run used: its system hash is compared with the trajectory's
   provenance.
 - The copy records what was done in `parameters/ucmd/identity_repair`: tool and version, the
@@ -39,7 +44,7 @@ DEFAULT_JUMP_NM = 0.7  # nm: above every move of a molecule between the pilot's 
 
 
 def repair(src: Path, dst: Path, package: Path, *, ratio: float = DEFAULT_RATIO,
-           jump_nm: float = DEFAULT_JUMP_NM) -> dict:  # fmt: skip
+           jump_nm: float = DEFAULT_JUMP_NM, skip_ps: float = 0.0) -> dict:  # fmt: skip
     top = load(package)
     with h5py.File(src, "r") as fh:
         sha = fh["parameters/ucmd"].attrs.get("system_sha256")
@@ -54,7 +59,9 @@ def repair(src: Path, dst: Path, package: Path, *, ratio: float = DEFAULT_RATIO,
         with h5py.File(dst, "r+") as fh:
             pos = fh["particles/all/position/value"]
             steps = fh["particles/all/position/step"][()]
-            for k in range(pos.shape[0]):
+            times = fh["particles/all/position/time"][()]
+            first = int(np.searchsorted(times, skip_ps - 1e-9))
+            for k in range(first, pos.shape[0]):
                 events = tracker.events
                 fixed = tracker.update(pos[k].astype(np.float64), jump_nm=jump_nm)
                 if tracker.events != events:
@@ -71,6 +78,8 @@ def repair(src: Path, dst: Path, package: Path, *, ratio: float = DEFAULT_RATIO,
                 "ratio_limit": ratio,
                 "worst_unambiguous_ratio": tracker.worst_ratio,
                 "jump_nm": jump_nm,
+                "skip_ps": skip_ps,
+                "first_tracked_step": int(steps[first]) if first < len(steps) else None,
                 "frames": int(pos.shape[0]),
             }
             fh["parameters/ucmd"].attrs["identity_repair"] = json.dumps(record)
@@ -88,10 +97,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--package", type=Path, required=True)
     ap.add_argument("--ratio", type=float, default=DEFAULT_RATIO)
     ap.add_argument("--jump-nm", type=float, default=DEFAULT_JUMP_NM)
+    ap.add_argument("--skip-ps", type=float, default=0.0)
     args = ap.parse_args(argv)
     try:
         record = repair(args.source, args.destination, args.package, ratio=args.ratio,
-                        jump_nm=args.jump_nm)  # fmt: skip
+                        jump_nm=args.jump_nm, skip_ps=args.skip_ps)  # fmt: skip
     except (IdentityError, ValueError, FileExistsError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
