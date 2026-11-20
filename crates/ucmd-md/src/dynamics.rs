@@ -13,6 +13,7 @@
 //! start of the step; the run loop requests the virial for those states.
 
 use crate::barostat::CRescale;
+use crate::constraints::{ConstraintError, Constraints};
 use crate::kinetics::{
     degrees_of_freedom, kinetic_energy, kinetic_tensor, pressure_tensor_bar, remove_com_velocity,
     temperature,
@@ -80,6 +81,15 @@ pub enum RunError {
     /// Inconsistent setup.
     #[error("invalid setup: {0}")]
     Setup(String),
+    /// A model constraint could not be satisfied (E2.5); the state is that of the last
+    /// completed step.
+    #[error("constraints failed at step {step}: {source}")]
+    Constraint {
+        /// The step that could not be completed.
+        step: u64,
+        /// Which constraint.
+        source: ConstraintError,
+    },
     /// An observer (writer) failed at the given step.
     #[error("output failed at step {step}: {message}")]
     Observer {
@@ -106,7 +116,12 @@ pub struct Dynamics<P: ForceProvider> {
     thermostat_work: f64,
     barostat: Option<CRescale>,
     barostat_work: f64,
+    constraints: Constraints,
 }
+
+/// Largest correction of the initial positions, relative to the constraint length, that the start
+/// accepts. Above it the package geometry does not fit its constraints (E2.5 design §2).
+const MAX_INITIAL_CORRECTION: f64 = 0.01;
 
 impl<P: ForceProvider> Dynamics<P> {
     /// Initialize the provider and evaluate the forces of the initial state.
@@ -126,6 +141,13 @@ impl<P: ForceProvider> Dynamics<P> {
         }
         if !config.dt_ps.is_finite() || config.dt_ps <= 0.0 {
             return Err(RunError::Setup("time step must be positive".into()));
+        }
+        let constraints = Constraints::from_system(system);
+        if !constraints.is_empty() && thermostat.as_ref().is_some_and(|t| t.acts_in_the_middle()) {
+            return Err(RunError::Setup(
+                "constraints with Langevin BAOAB are not implemented yet (E2.5, second step)"
+                    .into(),
+            ));
         }
         let mut provider = Guarded::new(provider);
         provider
@@ -152,7 +174,9 @@ impl<P: ForceProvider> Dynamics<P> {
             thermostat_work: 0.0,
             barostat: None,
             barostat_work: 0.0,
+            constraints,
         };
+        dynamics.project_initial_state()?;
         let request = EvalRequest {
             step: dynamics.state.step,
             time_ps: dynamics.state.time_ps,
@@ -172,7 +196,76 @@ impl<P: ForceProvider> Dynamics<P> {
                 step: state.step,
                 source,
             })?;
+        if let Some(w) = dynamics.forces.virial {
+            let wc = dynamics.constraint_virial_of_current_state()?;
+            dynamics.forces.virial = Some(w + wc);
+        }
         Ok(dynamics)
+    }
+
+    /// Put the start state on the constraints: positions (SHAKE onto themselves), then velocities
+    /// (RATTLE). A satisfied state (e.g. from a checkpoint) is left bit for bit unchanged.
+    fn project_initial_state(&mut self) -> Result<(), RunError> {
+        if self.constraints.is_empty() {
+            return Ok(());
+        }
+        let step = self.state.step;
+        let fail = |source| RunError::Constraint { step, source };
+        let reference = self.state.positions.clone();
+        let mut scratch = vec![Vec3::ZERO; reference.len()];
+        let largest = self
+            .constraints
+            .shake(
+                &mut self.state.positions,
+                &mut scratch,
+                &reference,
+                &self.inverse_masses,
+                self.state.cell.as_ref(),
+                1.0,
+            )
+            .map_err(fail)?;
+        if largest > MAX_INITIAL_CORRECTION {
+            return Err(RunError::Setup(format!(
+                "the start positions miss the constraints by up to {:.1} % of a constraint length; \
+                 the package geometry does not fit its constraints",
+                100.0 * largest
+            )));
+        }
+        self.constraints
+            .rattle(
+                &self.state.positions,
+                &mut self.state.velocities,
+                &self.masses,
+                &self.inverse_masses,
+                self.state.cell.as_ref(),
+                0.5 * self.config.dt_ps,
+            )
+            .map_err(fail)?;
+        Ok(())
+    }
+
+    /// Constraint virial of the current state, estimated as in a step: the velocity stage of a
+    /// half kick with the current forces (the velocities themselves are not changed).
+    fn constraint_virial_of_current_state(&self) -> Result<ucmd_core::Mat3, RunError> {
+        if self.constraints.is_empty() {
+            return Ok(ucmd_core::Mat3::ZERO);
+        }
+        let mut v = self.state.velocities.clone();
+        let dt_half = 0.5 * self.config.dt_ps;
+        kick(&mut v, &self.forces.forces, &self.inverse_masses, dt_half);
+        self.constraints
+            .rattle(
+                &self.state.positions,
+                &mut v,
+                &self.masses,
+                &self.inverse_masses,
+                self.state.cell.as_ref(),
+                dt_half,
+            )
+            .map_err(|source| RunError::Constraint {
+                step: self.state.step,
+                source,
+            })
     }
 
     /// Add a barostat. It needs a fully periodic cell, a provider that returns the virial, and
@@ -191,6 +284,11 @@ impl<P: ForceProvider> Dynamics<P> {
         if !self.provider.capabilities().virial || self.forces.virial.is_none() {
             return Err(RunError::Setup(
                 "a barostat needs the virial, which the force provider does not return".into(),
+            ));
+        }
+        if !self.constraints.is_empty() {
+            return Err(RunError::Setup(
+                "a barostat with constraints is not implemented yet (E2.5, second step)".into(),
             ));
         }
         self.barostat = Some(barostat);
@@ -280,6 +378,22 @@ impl<P: ForceProvider> Dynamics<P> {
                 &self.spare_velocities,
                 dt,
             );
+            // S: back onto the constraints (E2.5)
+            if !self.constraints.is_empty() {
+                self.constraints
+                    .shake(
+                        &mut self.spare_positions,
+                        &mut self.spare_velocities,
+                        &self.state.positions,
+                        &self.inverse_masses,
+                        self.state.cell.as_ref(),
+                        dt,
+                    )
+                    .map_err(|source| RunError::Constraint {
+                        step: next_step,
+                        source,
+                    })?;
+            }
         }
         // Barostat: scale the drifted positions, the velocities and the cell (E2.7).
         let mut new_cell = None;
@@ -320,6 +434,27 @@ impl<P: ForceProvider> Dynamics<P> {
         }
         if self.config.remove_com_every > 0 && next_step % self.config.remove_com_every == 0 {
             remove_com_velocity(&mut self.spare_velocities, &self.masses);
+        }
+        // R: velocities along the constraints removed; their constraint force belongs to the end
+        // of the step and enters its virial (E2.5 design §3)
+        if !self.constraints.is_empty() {
+            let wc = self
+                .constraints
+                .rattle(
+                    &self.spare_positions,
+                    &mut self.spare_velocities,
+                    &self.masses,
+                    &self.inverse_masses,
+                    cell,
+                    0.5 * dt,
+                )
+                .map_err(|source| RunError::Constraint {
+                    step: next_step,
+                    source,
+                })?;
+            if let Some(w) = self.next_forces.virial.as_mut() {
+                *w += wc;
+            }
         }
         if new_cell.is_some() {
             // ΔU of the rescaling by the trapezoid rule, −½(tr W_before + tr W_after)·dε/3, with
@@ -1309,5 +1444,305 @@ mod tests {
         let err = md.step().unwrap_err();
         assert!(matches!(err, RunError::Provider { step: 5, .. }));
         assert_eq!(md.state(), &good);
+    }
+
+    // -- constraints (E2.5) ------------------------------------------------------------------
+
+    /// `n` copies of a rigid molecule (masses, constraints), positions from `place`.
+    fn rigid_system(
+        masses: &[f64],
+        constraints: &[(usize, usize, f64)],
+        n: usize,
+        periodicity: [bool; 3],
+    ) -> System {
+        let atoms = masses
+            .iter()
+            .enumerate()
+            .map(|(i, &m)| AtomTemplate {
+                name: format!("A{i}"),
+                element: 0,
+                mass_amu: m,
+                charge_e: None,
+                atom_type: None,
+            })
+            .collect();
+        let mtype = MoleculeType {
+            name: "rigid".into(),
+            formal_charge_e: 0,
+            atoms,
+            bonds: vec![],
+            angles: vec![],
+            dihedrals: vec![],
+            impropers: vec![],
+            constraints: constraints
+                .iter()
+                .map(|&(i, j, d)| ucmd_core::Constraint {
+                    atoms: [i, j],
+                    length_nm: d,
+                })
+                .collect(),
+        };
+        System::new("rigid", vec![mtype], &[(0, n)], None, periodicity).unwrap()
+    }
+
+    /// Random unit vector from a seeded stream.
+    fn unit(rng: &mut rand_chacha::ChaCha8Rng) -> Vec3 {
+        use crate::random::uniform;
+        loop {
+            let v = Vec3::new(
+                2.0 * uniform(rng) - 1.0,
+                2.0 * uniform(rng) - 1.0,
+                2.0 * uniform(rng) - 1.0,
+            );
+            let l = v.length();
+            if l > 0.1 && l < 1.0 {
+                return v / l;
+            }
+        }
+    }
+
+    /// An ideal gas of rigid dimers: for a free rigid rotor the centripetal constraint force
+    /// cancels the rotational part of the atomic kinetic pressure, so at every step the atomic
+    /// pressure with the constraint virial equals the pressure of the molecular centres of mass,
+    /// up to the O(Δt²) error of the constraint-force estimate.
+    #[test]
+    fn constraint_virial_turns_atomic_into_molecular_pressure() {
+        use crate::random::{STREAM_VELOCITIES, stream};
+        use crate::velocities::maxwell_boltzmann;
+        let (n, d, edge) = (64, 0.1, 3.0);
+        let system = rigid_system(&[16.0, 16.0], &[(0, 1, d)], n, [true; 3]);
+        let mut rng = stream(7, STREAM_VELOCITIES);
+        let mut x = Vec::new();
+        for k in 0..n {
+            let c = Vec3::new(
+                (k % 4) as f64 * 0.75 + 0.3,
+                ((k / 4) % 4) as f64 * 0.75 + 0.3,
+                (k / 16) as f64 * 0.75 + 0.3,
+            );
+            let u = unit(&mut rng);
+            x.push(c + u * (0.5 * d));
+            x.push(c - u * (0.5 * d));
+        }
+        let dof = 6.0 * n as f64 - n as f64 - 3.0;
+        let v0 = maxwell_boltzmann(
+            system.masses(),
+            300.0,
+            dof,
+            true,
+            &mut stream(8, STREAM_VELOCITIES),
+        );
+        let cell = Cell::new(
+            [[edge, 0.0, 0.0], [0.0, edge, 0.0], [0.0, 0.0, edge]],
+            [true; 3],
+        )
+        .unwrap();
+        let state = State::new(x, Some(v0), Some(cell));
+        let config = DynamicsConfig {
+            com_removed: true,
+            virial_every_step: true,
+            ..DynamicsConfig::nve(0.002)
+        };
+        let mut md = Dynamics::new(&system, IdealGas, state, config, None).unwrap();
+        let constraints = Constraints::from_system(&system);
+        let masses = system.masses().to_vec();
+        let volume = edge * edge * edge;
+        let k0 = md.kinetic_energy();
+        let mut worst_relative = 0.0f64;
+        let mut worst_violation = 0.0f64;
+        let mut sum_atomic = 0.0;
+        let mut sum_com = 0.0;
+        md.run(5000, |m| {
+            let s = m.snapshot();
+            let p = s.pressure_bar.unwrap();
+            let atomic = (p.x_axis.x + p.y_axis.y + p.z_axis.z) / 3.0;
+            // centre-of-mass kinetic pressure: Σ_mol M V² / (3V)
+            let v = &m.state().velocities;
+            let mut two_k = 0.0;
+            for mol in 0..n {
+                let (a, b) = (2 * mol, 2 * mol + 1);
+                let mtot = masses[a] + masses[b];
+                let vc = (v[a] * masses[a] + v[b] * masses[b]) / mtot;
+                two_k += mtot * vc.length_squared();
+            }
+            let com = two_k / (3.0 * volume) * ucmd_core::units::BAR_PER_KJMOL_NM3;
+            worst_relative = worst_relative.max((atomic - com).abs() / com);
+            worst_violation = worst_violation
+                .max(constraints.max_violation(&m.state().positions, m.state().cell.as_ref()));
+            sum_atomic += atomic;
+            sum_com += com;
+        })
+        .unwrap();
+        eprintln!(
+            "rigid dimers: worst |P_atomic − P_com|/P_com {worst_relative:.2e}, mean ratio {:.6}, \
+             worst violation {worst_violation:.1e}, ΔK/K {:.1e}",
+            sum_atomic / sum_com,
+            (md.kinetic_energy() - k0) / k0
+        );
+        assert!(worst_violation < 1e-10);
+        assert!((sum_atomic / sum_com - 1.0).abs() < 1e-3);
+        assert!(worst_relative < 0.02);
+        // free rotors and free flight: the kinetic energy is conserved
+        assert!(((md.kinetic_energy() - k0) / k0).abs() < 1e-3);
+    }
+
+    /// Rigid water-like triangles in a harmonic field, NVE: every constraint holds after every
+    /// step, the relative velocities are perpendicular to the constraints, energy is conserved.
+    #[test]
+    fn rigid_triangles_keep_their_shape_and_conserve_energy() {
+        use crate::random::{STREAM_VELOCITIES, stream};
+        use crate::velocities::maxwell_boltzmann;
+        let (r_oh, r_hh) = (0.1, 0.163_299_316);
+        let system = rigid_system(
+            &[15.9994, 1.008, 1.008],
+            &[(0, 1, r_oh), (0, 2, r_oh), (1, 2, r_hh)],
+            8,
+            [false; 3],
+        );
+        let mut rng = stream(11, STREAM_VELOCITIES);
+        let mut x = Vec::new();
+        for k in 0..8 {
+            let o = Vec3::new(k as f64 * 0.4 - 1.4, (k % 3) as f64 * 0.3, 0.1 * k as f64);
+            let a = unit(&mut rng);
+            let c = unit(&mut rng);
+            let b = (c - a * c.dot(a)).normalize(); // perpendicular to a
+            let half = (r_hh / 2.0 / r_oh).asin();
+            x.push(o);
+            x.push(o + (a * half.cos() + b * half.sin()) * r_oh);
+            x.push(o + (a * half.cos() - b * half.sin()) * r_oh);
+        }
+        let v0 = maxwell_boltzmann(
+            system.masses(),
+            300.0,
+            48.0,
+            false,
+            &mut stream(12, STREAM_VELOCITIES),
+        );
+        let state = State::new(x, Some(v0), None);
+        let mut md = Dynamics::new(
+            &system,
+            Tether(50.0),
+            state,
+            DynamicsConfig::nve(0.002),
+            None,
+        )
+        .unwrap();
+        let constraints = Constraints::from_system(&system);
+        let e0 = md.conserved_energy().unwrap();
+        let mut worst_e = 0.0f64;
+        let mut worst_violation = 0.0f64;
+        let mut worst_radial = 0.0f64;
+        md.run(20_000, |m| {
+            let st = m.state();
+            worst_violation = worst_violation.max(constraints.max_violation(&st.positions, None));
+            for mol in 0..8 {
+                for (i, j) in [(0, 1), (0, 2), (1, 2)] {
+                    let (i, j) = (3 * mol + i, 3 * mol + j);
+                    let r = st.positions[i] - st.positions[j];
+                    worst_radial = worst_radial
+                        .max(r.normalize().dot(st.velocities[i] - st.velocities[j]).abs());
+                }
+            }
+            worst_e = worst_e.max((m.conserved_energy().unwrap() - e0).abs());
+        })
+        .unwrap();
+        eprintln!(
+            "rigid triangles: violation {worst_violation:.1e}, radial velocity {worst_radial:.1e} nm/ps, \
+             max |ΔE| {worst_e:.2e} of E₀ {e0:.3} kJ/mol"
+        );
+        assert!(worst_violation < 1e-10);
+        assert!(worst_radial < 1e-9);
+        assert!(worst_e / e0.abs() < 1e-3);
+    }
+
+    #[test]
+    fn langevin_or_a_barostat_with_constraints_are_refused_for_now() {
+        use crate::barostat::{CRescale, CRescaleConfig};
+        use crate::random::{STREAM_BAROSTAT, STREAM_THERMOSTAT, stream};
+        use crate::thermostat::Langevin;
+        let system = rigid_system(&[1.0, 1.0], &[(0, 1, 0.1)], 1, [true; 3]);
+        let cell = || {
+            Some(
+                Cell::new(
+                    [[2.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 2.0]],
+                    [true; 3],
+                )
+                .unwrap(),
+            )
+        };
+        let x = vec![Vec3::new(1.0, 1.0, 1.0), Vec3::new(1.1, 1.0, 1.0)];
+        let state = || State::new(x.clone(), None, cell());
+        let langevin = Box::new(Langevin::new(300.0, 1.0, stream(1, STREAM_THERMOSTAT)));
+        assert!(matches!(
+            Dynamics::new(&system, IdealGas, state(), DynamicsConfig::nve(0.001), Some(langevin)),
+            Err(RunError::Setup(m)) if m.contains("Langevin")
+        ));
+        let md =
+            Dynamics::new(&system, IdealGas, state(), DynamicsConfig::nve(0.001), None).unwrap();
+        let barostat = CRescale::new(
+            CRescaleConfig {
+                pressure_bar: 1.0,
+                tau_ps: 1.0,
+                compressibility_per_bar: 4.5e-5,
+                every: 10,
+                temperature_k: 300.0,
+            },
+            stream(1, STREAM_BAROSTAT),
+        )
+        .unwrap();
+        assert!(
+            matches!(md.with_barostat(barostat), Err(RunError::Setup(m)) if m.contains("barostat"))
+        );
+    }
+
+    #[test]
+    fn a_start_far_off_the_constraints_is_refused() {
+        let system = rigid_system(&[1.0, 1.0], &[(0, 1, 0.1)], 1, [false; 3]);
+        let state = State::new(vec![Vec3::ZERO, Vec3::new(0.12, 0.0, 0.0)], None, None);
+        assert!(matches!(
+            Dynamics::new(&system, Tether(1.0), state, DynamicsConfig::nve(0.001), None),
+            Err(RunError::Setup(m)) if m.contains("do not fit") || m.contains("does not fit")
+        ));
+    }
+
+    /// A restart from the state of step 100 continues bit for bit like the uninterrupted run:
+    /// the start projection leaves a satisfied state unchanged (E2.5 design §4).
+    #[test]
+    fn a_restart_with_constraints_is_bitwise_identical() {
+        use crate::random::{STREAM_VELOCITIES, stream};
+        use crate::velocities::maxwell_boltzmann;
+        let system = rigid_system(&[12.0, 16.0], &[(0, 1, 0.12)], 4, [false; 3]);
+        let mut rng = stream(21, STREAM_VELOCITIES);
+        let mut x = Vec::new();
+        for k in 0..4 {
+            let c = Vec3::new(0.4 * k as f64, 0.0, 0.0);
+            let u = unit(&mut rng);
+            x.push(c + u * 0.06);
+            x.push(c - u * 0.06);
+        }
+        let v0 = maxwell_boltzmann(
+            system.masses(),
+            300.0,
+            20.0,
+            false,
+            &mut stream(22, STREAM_VELOCITIES),
+        );
+        let make = |state: State| {
+            Dynamics::new(
+                &system,
+                Tether(20.0),
+                state,
+                DynamicsConfig::nve(0.002),
+                None,
+            )
+            .unwrap()
+        };
+        let mut whole = make(State::new(x.clone(), Some(v0.clone()), None));
+        whole.run(200, |_| {}).unwrap();
+        let mut first = make(State::new(x, Some(v0), None));
+        first.run(100, |_| {}).unwrap();
+        let mut second = make(first.state().clone());
+        second.run(100, |_| {}).unwrap();
+        assert_eq!(second.state().positions, whole.state().positions);
+        assert_eq!(second.state().velocities, whole.state().velocities);
     }
 }

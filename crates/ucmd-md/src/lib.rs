@@ -13,6 +13,7 @@
 //! `ucmd-force`, never on a provider crate. `scripts/check-architecture.sh` enforces this.
 
 pub mod barostat;
+pub mod constraints;
 pub mod dynamics;
 pub mod kinetics;
 pub mod minimize;
@@ -21,5 +22,6 @@ pub mod thermostat;
 pub mod velocities;
 
 pub use barostat::{CRescale, CRescaleConfig};
+pub use constraints::{ConstraintError, Constraints};
 pub use dynamics::{Dynamics, DynamicsConfig, RunError, drift_into, kick};
 pub use thermostat::{Csvr, Langevin, NoseHooverChain, Thermostat};

@@ -763,38 +763,90 @@ fn the_pressure_tensor_columns_add_up_to_the_pressure() {
     assert!(text.contains("E_INCOMPATIBLE"), "{text}");
 }
 
-/// Until E2.5 the reference backend refuses packages with model constraints instead of running
-/// them with free constrained bonds (found 2026-11-20: such a run went through silently).
+/// E2.5: a package with model constraints runs (RATTLE) and keeps them; minimization with
+/// constraints is still refused (FIRE does not project yet).
 #[test]
-fn packages_with_constraints_are_refused_until_e25() {
+fn rigid_water_runs_and_minimization_with_constraints_is_refused() {
     let Some(spec) = spec() else { return };
     let dir = run_dir(
-        "constraints_refused",
+        "constraints_rigid",
         &spec,
         "water-2",
         "spec_version = \"0.1.0\"\nsystem = \"system.ucsys\"\n\n[run]\nintegrator = \"velocity-verlet\"\n\
-         timestep_fs = 0.5\nsteps = 10\nseed = 1\n\n[[providers]]\nkind = \"force-field\"\n\
-         coulomb = \"direct\"\n",
+         timestep_fs = 1.0\nsteps = 2000\nseed = 1\n\n[[providers]]\nkind = \"force-field\"\n\
+         coulomb = \"direct\"\n\n[output]\ndirectory = \"out\"\n\n[output.thermo]\n\
+         file = \"t.tsv\"\nevery = 10\n",
     );
+    // SPC/Fw held rigid at its equilibrium geometry: three distances per molecule
     let path = dir.join("system.ucsys/system.json");
     let mut doc: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    doc["molecule_types"]["SPCFw"]["constraints"] =
-        serde_json::json!([{"atoms": [0, 1], "length_nm": 0.1012}]);
+    let (r_oh, theta) = (0.1012_f64, 113.24_f64.to_radians());
+    let r_hh = 2.0 * r_oh * (theta / 2.0).sin();
+    doc["molecule_types"]["SPCFw"]["constraints"] = serde_json::json!([
+        {"atoms": [0, 1], "length_nm": r_oh},
+        {"atoms": [0, 2], "length_nm": r_oh},
+        {"atoms": [1, 2], "length_nm": r_hh}
+    ]);
     std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
-    for args in [vec!["run"], vec!["minimize", "--out", "min.ucsys"]] {
-        let out = ucmd()
-            .args(&args)
-            .arg(dir.join("run.toml"))
-            .current_dir(&dir)
-            .output()
-            .unwrap();
-        assert!(!out.status.success(), "{args:?} accepted constraints");
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains("E_UNSUPPORTED"),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+    // the fixture is deliberately distorted (so its forces are not zero): place both molecules
+    // exactly at the rigid geometry, 0.5 nm apart, in different orientations
+    let h = theta / 2.0;
+    let mut x = Vec::new();
+    for (o, flip) in [
+        (ucmd_core::Vec3::ZERO, 1.0),
+        (ucmd_core::Vec3::new(0.5, 0.1, 0.0), -1.0),
+    ] {
+        x.push(o);
+        x.push(o + ucmd_core::Vec3::new(r_oh * h.sin(), flip * r_oh * h.cos(), 0.0));
+        x.push(o + ucmd_core::Vec3::new(-r_oh * h.sin(), flip * r_oh * h.cos(), 0.0));
     }
-    assert!(!dir.join("out/t.tsv").exists() && !dir.join("min.ucsys").exists());
+    ucmd_io::npy::write_vec3_array(&dir.join("system.ucsys/positions.npy"), &x).unwrap();
+    let out = ucmd()
+        .arg("run")
+        .arg(dir.join("run.toml"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let table = std::fs::read_to_string(dir.join("out/t.tsv")).unwrap();
+    let mut lines = table.lines();
+    let names: Vec<&str> = lines
+        .next()
+        .unwrap()
+        .trim_start_matches("# ")
+        .split('\t')
+        .collect();
+    let col = |n: &str| names.iter().position(|c| *c == n).unwrap();
+    let rows: Vec<Vec<f64>> = lines
+        .map(|l| l.split('\t').map(|x| x.parse().unwrap()).collect())
+        .collect();
+    let range = |k: usize| {
+        let v = rows.iter().map(|r| r[k]);
+        v.clone().fold(f64::MIN, f64::max) - v.fold(f64::MAX, f64::min)
+    };
+    // the two molecules attract and exchange ~19 kJ/mol between U and K; the total holds to
+    // 0.4 % of that during the close approach and drifts by ~1e-4 kJ/mol (2026-11-20)
+    let (exchanged, spread) = (range(col("potential_kjmol")), range(col("total_kjmol")));
+    let drift = (rows[rows.len() - 1][col("total_kjmol")] - rows[0][col("total_kjmol")]).abs();
+    assert!(
+        exchanged > 5.0,
+        "the test needs energy exchange, got {exchanged}"
+    );
+    assert!(
+        spread < 0.01 * exchanged,
+        "spread {spread} of {exchanged} kJ/mol exchanged"
+    );
+    assert!(drift < 1e-3 * exchanged, "drift {drift} kJ/mol");
+    let min = ucmd()
+        .args(["minimize", "--out", "min.ucsys"])
+        .arg(dir.join("run.toml"))
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(!min.status.success());
+    assert!(String::from_utf8_lossy(&min.stderr).contains("E_UNSUPPORTED"));
 }
