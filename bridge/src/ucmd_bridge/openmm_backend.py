@@ -119,6 +119,12 @@ def read_plan(run_toml: Path) -> Plan:
     if raw.get("momentum", {}).get("remove_angular"):
         raise ConfigError("remove_angular is not implemented in the OpenMM backend")
     output = raw.get("output", {})
+    if output.get("thermo", {}).get("pressure_tensor"):
+        # spec 0.1.1: a backend that cannot compute the tensor refuses the run
+        raise ConfigError(
+            "E_UNSUPPORTED  [output.thermo] pressure_tensor: OpenMM gives no pressure tensor; "
+            "run on the CPU backend"
+        )
     return Plan(
         run_toml=run_toml,
         raw=raw,

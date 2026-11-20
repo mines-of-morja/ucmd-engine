@@ -192,6 +192,20 @@ def test_csvr_and_a_wrong_model_are_refused(tmp_path: Path) -> None:
     assert r.returncode == 2 and "conformance check failed" in r.stderr
 
 
+def test_the_pressure_tensor_is_refused(tmp_path: Path) -> None:
+    """Spec 0.1.1: OpenMM gives no pressure tensor, so [output.thermo] pressure_tensor must stop
+    the run before it starts, not produce a table without it."""
+    text = ARGON.format(steps=20, thermostat="nose-hoover-chain").replace(
+        '[output.thermo]\nfile = "thermo.tsv"\nevery = 10\n',
+        '[output.thermo]\nfile = "thermo.tsv"\nevery = 10\npressure_tensor = true\n',
+    )
+    assert "pressure_tensor = true" in text
+    profile = setup_run(tmp_path, "argon-864", text.replace('"0.1.0"', '"0.1.1"', 1))
+    r = ucmd(tmp_path, profile)
+    assert r.returncode != 0 and "E_UNSUPPORTED" in r.stderr, r.stderr
+    assert not (tmp_path / "out/thermo.tsv").exists()
+
+
 def test_sigterm_stops_gracefully_with_a_checkpoint(tmp_path: Path) -> None:
     profile = setup_run(
         tmp_path, "argon-864", ARGON.format(steps=500000, thermostat="nose-hoover-chain")

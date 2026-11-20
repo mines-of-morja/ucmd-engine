@@ -692,3 +692,73 @@ fn rerun_reproduces_the_recorded_energies() {
     assert_eq!(recorded.len(), 5);
     assert_eq!(recorded, reevaluated);
 }
+
+/// Spec 0.1.1: `[output.thermo] pressure_tensor` writes six columns whose trace / 3 is the
+/// pressure column; a non-periodic system is refused (E_INCOMPATIBLE).
+#[test]
+fn the_pressure_tensor_columns_add_up_to_the_pressure() {
+    let Some(spec) = spec() else { return };
+    let text = std::fs::read_to_string(spec.join("fixtures/runs/argon-pressure-tensor.toml"))
+        .unwrap()
+        .replace(
+            "system = \"../valid/argon-864\"",
+            "system = \"system.ucsys\"",
+        )
+        .replace("steps = 25000", "steps = 200");
+    let dir = run_dir("pressure_tensor", &spec, "argon-864", &text);
+    let out = ucmd()
+        .arg("run")
+        .arg(dir.join("run.toml"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let table = std::fs::read_to_string(dir.join("out/thermo.tsv")).unwrap();
+    let mut lines = table.lines();
+    let names: Vec<&str> = lines
+        .next()
+        .unwrap()
+        .trim_start_matches("# ")
+        .split('\t')
+        .collect();
+    let col = |n: &str| names.iter().position(|c| *c == n).unwrap();
+    let tensor = ucmd_io::thermo::PRESSURE_TENSOR_COLUMNS.map(col);
+    assert_eq!(
+        tensor,
+        [9, 10, 11, 12, 13, 14].map(|k| k + names.len() - 15)
+    );
+    let mut rows = 0;
+    for line in lines {
+        let v: Vec<f64> = line.split('\t').map(|x| x.parse().unwrap()).collect();
+        let trace = (v[tensor[0]] + v[tensor[1]] + v[tensor[2]]) / 3.0;
+        let p = v[col("pressure_bar")];
+        assert!(
+            (trace - p).abs() <= 1e-8 * p.abs().max(1.0),
+            "{trace} vs {p}"
+        );
+        assert!(v[tensor[3]].is_finite() && v[tensor[3]] != 0.0);
+        rows += 1;
+    }
+    assert_eq!(rows, 21);
+
+    let flat = std::fs::read_to_string(spec.join("fixtures/runs/harmonic-nve.toml"))
+        .unwrap()
+        .replace(
+            "system = \"../valid/harmonic-3d\"",
+            "system = \"system.ucsys\"",
+        )
+        .replace("spec_version = \"0.1.0\"", "spec_version = \"0.1.1\"")
+        + "\n[output]\ndirectory = \"out\"\n\n[output.thermo]\nfile = \"t.tsv\"\nevery = 1\npressure_tensor = true\n";
+    let dir = run_dir("pressure_tensor_flat", &spec, "harmonic-3d", &flat);
+    let out = ucmd()
+        .arg("check")
+        .arg(dir.join("run.toml"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout) + String::from_utf8_lossy(&out.stderr);
+    assert!(text.contains("E_INCOMPATIBLE"), "{text}");
+}

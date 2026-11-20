@@ -127,6 +127,20 @@ pub struct FileOutput {
     pub every: u64,
 }
 
+/// `[output.thermo]`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThermoOutput {
+    /// File name relative to the output directory.
+    pub file: String,
+    /// Interval in steps.
+    pub every: u64,
+    /// Spec 0.1.1: also write the six components of the symmetrized pressure tensor in bar.
+    /// Not serialized when false, so the restart fingerprint of older runs stays the same.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pressure_tensor: bool,
+}
+
 /// `[output.trajectory]`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -158,7 +172,7 @@ pub struct OutputSection {
     pub trajectory: Option<TrajectoryOutput>,
     /// Thermo table output.
     #[serde(default)]
-    pub thermo: Option<FileOutput>,
+    pub thermo: Option<ThermoOutput>,
     /// Checkpoint output.
     #[serde(default)]
     pub checkpoint: Option<FileOutput>,
@@ -396,6 +410,18 @@ impl RunConfig {
                 "/barostat",
             ));
         }
+        let pressure_tensor = self
+            .output
+            .as_ref()
+            .and_then(|o| o.thermo.as_ref())
+            .is_some_and(|t| t.pressure_tensor);
+        if pressure_tensor && !system.periodicity.iter().all(|&p| p) {
+            return Err(SpecError::new(
+                ErrorCode::Incompatible,
+                "the pressure tensor needs a fully periodic system",
+                "/output/thermo/pressure_tensor",
+            ));
+        }
         if self.momentum.as_ref().is_some_and(|m| m.remove_angular) && system.is_periodic() {
             return Err(SpecError::new(
                 ErrorCode::Incompatible,
@@ -516,5 +542,40 @@ impl MachineProfile {
             ));
         }
         Ok(profile)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::{FileOutput, ThermoOutput};
+
+    /// Spec 0.1.1 added `pressure_tensor` to `[output.thermo]`. Without it the resolved
+    /// configuration must serialize exactly as before, or the restart fingerprint of every run
+    /// started before the change would differ and its restart would be refused.
+    #[test]
+    fn thermo_without_pressure_tensor_serializes_as_before() {
+        let old = FileOutput {
+            file: "thermo.tsv".into(),
+            every: 10,
+        };
+        let new = ThermoOutput {
+            file: "thermo.tsv".into(),
+            every: 10,
+            pressure_tensor: false,
+        };
+        assert_eq!(
+            toml::to_string(&old).unwrap(),
+            toml::to_string(&new).unwrap()
+        );
+        let with = ThermoOutput {
+            pressure_tensor: true,
+            ..new
+        };
+        assert!(
+            toml::to_string(&with)
+                .unwrap()
+                .contains("pressure_tensor = true")
+        );
     }
 }
