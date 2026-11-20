@@ -122,11 +122,11 @@ impl Constraints {
             let mut converged = true;
             for &(i, j, d) in &self.pairs {
                 let r = separation(cell, x[i], x[j]);
-                let diff = d * d - r.length_squared();
-                // |r² − d²|/(2d²) ≈ |r − d|/d
-                if diff.abs() <= 2.0 * self.tolerance * d * d {
+                // the documented criterion exactly: |r − d|/d ≤ tolerance
+                if (r.length() - d).abs() <= self.tolerance * d {
                     continue;
                 }
+                let diff = d * d - r.length_squared();
                 converged = false;
                 let r_ref = separation(cell, reference[i], reference[j]);
                 let (wi, wj) = (inverse_masses[i], inverse_masses[j]);
