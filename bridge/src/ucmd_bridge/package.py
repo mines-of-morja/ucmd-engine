@@ -47,6 +47,7 @@ class Topology:
     excluded: list
     pairs14: list
     constraints: list
+    molecule_type: tuple[str, ...] = ()  # per molecule, in canonical order
 
     @property
     def n_atoms(self) -> int:
@@ -92,6 +93,7 @@ def load(path: Path | str) -> Topology:
     )
     offset = 0
     molecule_count = 0
+    molecule_type: list[str] = []
     for component in doc["components"]:
         mtype = doc["molecule_types"][component["molecule_type"]]
         n = len(mtype["atoms"])
@@ -154,6 +156,7 @@ def load(path: Path | str) -> Topology:
                 constraints.append((o + i, o + j, c["length_nm"]))
             offset += n
             molecule_count += 1
+            molecule_type.append(component["molecule_type"])
     cell = None if doc["cell_nm"] is None else np.array(doc["cell_nm"], dtype=float)
     vfile = path / "velocities.npy"
     return Topology(
@@ -181,4 +184,5 @@ def load(path: Path | str) -> Topology:
         excluded,
         pairs14,
         constraints,
+        tuple(molecule_type),
     )
