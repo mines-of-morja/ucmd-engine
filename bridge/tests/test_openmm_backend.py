@@ -141,6 +141,7 @@ def test_restart_appends_from_the_checkpoint(tmp_path: Path) -> None:
     r = ucmd(tmp_path, profile, "--restart", "out/checkpoint.ucchk")
     assert r.returncode == 0, r.stderr
     assert "(restart)" in r.stderr
+    assert "identity: 0 molecule labels corrected" in r.stderr  # the CPU does not reorder
     _names, rows = thermo(tmp_path)
     assert rows[:, 0].tolist() == list(range(0, 201, 10))  # no duplicate rows
     import h5py

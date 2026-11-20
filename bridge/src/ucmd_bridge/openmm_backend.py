@@ -475,6 +475,11 @@ def run(args: argparse.Namespace) -> int:
     if stop.signal is not None and status == 0:
         print(f"stopped by signal after step {step}; the state is in {ckpt_path}", file=sys.stderr)
         return 128 + stop.signal
+    print(
+        f"identity: {tracker.exchanges} molecule labels corrected (worst match ratio "
+        f"{tracker.worst_ratio:.2f})",
+        file=sys.stderr,
+    )
     if status == 0:
         print(f"done: {done} steps in {elapsed:.2f} s ({rate:.1f} ns/day)", file=sys.stderr)
     return status
