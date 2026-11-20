@@ -214,3 +214,26 @@ def test_strict_mode_accepts_a_fast_but_unambiguous_molecule() -> None:
     z[mol == 31] += [0.0, 0.7, 0.0]  # beyond 3 × max_move: impossible in 0.25 ps
     with pytest.raises(IdentityError, match="too far apart"):
         tracker.update(z)
+
+
+def test_strict_mode_keeps_labels_of_fast_neighbours_without_a_relabelling() -> None:
+    """EC, 2026-11-20: in the violent start of a dense NPT box two identical molecules both
+    moved fast; each is still nearest to itself, but the second candidate is close (ratio > 0.5).
+    No label changes, so there is nothing ambiguous to decide."""
+    mol, x, a, b = _two_li(np.random.default_rng(3), 0.42)
+    tracker = Tracker(mol, TYPES)
+    tracker.update(x)
+    y = x.copy()
+    # both move 0.25 nm sideways: each is 0.25 nm from its old place and 0.49 nm from the
+    # other's (ratio 0.51 > 0.5), but each is still nearest to itself
+    y[a] = x[a] + [0.0, 0.25, 0.0]
+    y[b] = x[b] + [0.0, 0.25, 0.0]
+    assert np.array_equal(tracker.update(y), y)
+    assert tracker.exchanges == 0
+    # moved along the pair axis instead, b's old place is nearer to a's new one: a real
+    # ambiguity, which must stay an error
+    z = y.copy()
+    z[a] = y[a] + [0.25, 0.0, 0.0]
+    z[b] = y[b] + [0.25, 0.0, 0.0]
+    with pytest.raises(IdentityError, match="ambiguous"):
+        tracker.update(z)

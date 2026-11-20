@@ -29,6 +29,8 @@
   - two distinct identical molecules are never closer than about 0.3 nm.
   - So only molecules that moved more than `max_move_nm` (0.2 nm) are suspects. Only suspects
     are matched, among themselves (a swap makes both partners suspects).
+  - A relabelling must be unambiguous; a suspect that finds itself nearest keeps its label even
+    when a neighbour is about as close (no label changes, nothing to decide).
   - After relabelling, a molecule may still have moved more than `max_move_nm` if its match was
     unambiguous: fast but real motion, e.g. in the violent first picoseconds of a too dense
     start (A4, 2026-11-20). Only moves beyond `MAX_PHYSICAL_MOVE_FACTOR × max_move_nm`
@@ -202,15 +204,21 @@ class Tracker:
                 prev = self._molecules(self.previous, ids, ids)
                 cur = self._molecules(raw, ids, slots)
                 match, ratio = _assign(self._rmsd(prev, cur, int(self.sizes[ids[0]])))
-                if np.any(ratio > self.ratio):
-                    k = int(np.argmax(ratio))
+                # Ambiguity matters only where the matching would change a label. Fast molecules
+                # that each find themselves nearest keep their labels even if a neighbour is
+                # about as close (the violent first picoseconds of a dense NPT start, EC
+                # 2026-11-20); a relabelling must be unambiguous.
+                changed = match != np.arange(len(ids))
+                doubtful = changed & (ratio > self.ratio)
+                if np.any(doubtful):
+                    k = int(np.flatnonzero(doubtful)[np.argmax(ratio[doubtful])])
                     raise IdentityError(
                         f"{name}: molecule {int(ids[k])} is ambiguous (nearest / second-nearest "
                         f"atom RMSD {ratio[k]:.2f} > {self.ratio}); reads are too far apart to "
                         f"keep molecule identities"
                     )
-                if len(ids) > 1:
-                    self.worst_ratio = max(self.worst_ratio, float(ratio.max()))
+                if np.any(changed):
+                    self.worst_ratio = max(self.worst_ratio, float(ratio[changed].max()))
                 self.exchanges += int((match != np.arange(len(ids))).sum())
                 new_slot[ids] = slots[match]
             self.slot = new_slot
