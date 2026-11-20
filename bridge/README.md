@@ -27,6 +27,19 @@ Then `ucmd run run.toml` works as usual, from the shell, the study driver or the
    Nosé–Hoover chain, Langevin BAOAB, all with full-step velocities. C-rescale becomes
    MonteCarloBarostat (same ensemble).
 5. It writes the spec's thermo table and H5MD or XYZ trajectory, and its own checkpoint.
+6. It writes positions in canonical order. On the GPU, OpenMM's output exchanged identical
+   molecules (pilot of 2026-11-20); `identity.py` tracks the molecules every 250 steps and
+   undoes it. An ambiguous match stops the run (see `validation/e37-identity`).
+
+## Repairing trajectories written before the identity fix
+
+GPU trajectories written before 2026-11-20 can contain exchanged molecule labels. Collective
+quantities (κ, t₊, L_ij) are right; self-diffusion and residence times are not. Write a
+corrected copy (the source stays unchanged; the copy records what was done):
+
+```sh
+python -m ucmd_bridge.repair out/trajectory.h5 out/trajectory.repaired.h5 --package SYSTEM.ucsys
+```
 
 ## GPU container (AMD, ROCm)
 
