@@ -763,10 +763,10 @@ fn the_pressure_tensor_columns_add_up_to_the_pressure() {
     assert!(text.contains("E_INCOMPATIBLE"), "{text}");
 }
 
-/// E2.5: a package with model constraints runs (RATTLE) and keeps them; minimization with
-/// constraints is still refused (FIRE does not project yet).
+/// E2.5: a package with model constraints runs (RATTLE) and keeps them, and minimizes on the
+/// constraint manifold.
 #[test]
-fn rigid_water_runs_and_minimization_with_constraints_is_refused() {
+fn rigid_water_runs_and_minimizes_with_constraints() {
     let Some(spec) = spec() else { return };
     let dir = run_dir(
         "constraints_rigid",
@@ -841,12 +841,23 @@ fn rigid_water_runs_and_minimization_with_constraints_is_refused() {
         "spread {spread} of {exchanged} kJ/mol exchanged"
     );
     assert!(drift < 1e-3 * exchanged, "drift {drift} kJ/mol");
+    // E2.5 step 5: minimization with constraints (FIRE on the constraint manifold)
     let min = ucmd()
-        .args(["minimize", "--out", "min.ucsys"])
+        .args(["minimize", "--out", "min.ucsys", "--max-force", "1"])
         .arg(dir.join("run.toml"))
         .current_dir(&dir)
         .output()
         .unwrap();
-    assert!(!min.status.success());
-    assert!(String::from_utf8_lossy(&min.stderr).contains("E_UNSUPPORTED"));
+    assert!(
+        min.status.success(),
+        "{}",
+        String::from_utf8_lossy(&min.stderr)
+    );
+    let x = ucmd_io::npy::read_vec3_array(&dir.join("min.ucsys/positions.npy"), 6).unwrap();
+    for mol in [0, 3] {
+        for (i, j, d) in [(0, 1, r_oh), (0, 2, r_oh), (1, 2, r_hh)] {
+            let r = (x[mol + i] - x[mol + j]).length();
+            assert!((r - d).abs() < 1e-9 * d, "constraint {i}-{j}: {r} vs {d}");
+        }
+    }
 }

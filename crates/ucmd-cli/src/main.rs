@@ -270,25 +270,11 @@ fn singlepoint(run_toml: &Path, forces_out: Option<&Path>) -> Result<()> {
 }
 
 /// Initial velocities and momentum handling of spec/run-config.md (`[velocities]`, `[momentum]`).
-/// FIRE does not project onto model constraints yet (E2.5, second step). Without this check a
-/// minimization would move constrained bonds freely (they have no bond term).
-fn refuse_constraints(system: &ucmd_core::System) -> Result<()> {
-    let n = system.n_constraints();
-    if n > 0 {
-        bail!(
-            "E_UNSUPPORTED  the package has {n} model constraints; minimization with constraints \
-             is not implemented yet (E2.5, second step)"
-        );
-    }
-    Ok(())
-}
-
 fn minimize(run_toml: &Path, out: &Path, max_force: f64, max_steps: u64) -> Result<()> {
     if out.exists() {
         bail!("{} exists; choose a new directory", out.display());
     }
     let s = setup(run_toml)?;
-    refuse_constraints(&s.package.system)?;
     let state = &s.package.state;
     let mut provider = Guarded::new(registry::make_providers(&s.config, state)?);
     provider
@@ -311,6 +297,7 @@ fn minimize(run_toml: &Path, out: &Path, max_force: f64, max_steps: u64) -> Resu
         s.package.system.masses(),
         &mut positions,
         state.cell.as_ref(),
+        &ucmd_md::Constraints::from_system(&s.package.system),
         &config,
         |step, energy, force| {
             if step % 100 == 0 {

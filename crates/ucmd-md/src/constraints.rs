@@ -191,18 +191,18 @@ impl Constraints {
         Err(self.failure(x, cell, "velocities"))
     }
 
-    /// Constraint virial W_c = Σ r_ij ⊗ g_ij (kJ/mol) of a state on the constraints: the exact
-    /// instantaneous constraint forces g = λ r_ij that keep d²|r_ij|²/dt² = 0, i.e.
-    /// |v_ij|² + r_ij·(a_i − a_j) = 0 with a = (F + g)/m, solved by Gauss–Seidel to the relative
-    /// tolerance. `forces` are the provider's forces (kJ/mol/nm), `v` the projected velocities.
-    pub fn force_virial(
+    /// The exact instantaneous constraint forces of a state on the constraints: g_i (kJ/mol/nm)
+    /// per atom and λ per constraint (g = ±λ r_ij), such that d²|r_ij|²/dt² = 0, i.e.
+    /// |v_ij|² + r_ij·(a_i − a_j) = 0 with a = (F + g)/m. Solved by Gauss–Seidel to the relative
+    /// tolerance. `forces` are the provider's forces, `v` velocities on the constraints.
+    pub fn constraint_forces(
         &self,
         x: &[Vec3],
         v: &[Vec3],
         forces: &[Vec3],
         inverse_masses: &[f64],
         cell: Option<&Cell>,
-    ) -> Result<Mat3, ConstraintError> {
+    ) -> Result<(Vec<Vec3>, Vec<f64>), ConstraintError> {
         let mut g = vec![Vec3::ZERO; x.len()];
         let mut lambda = vec![0.0; self.pairs.len()];
         for iteration in 0..MAX_ITERATIONS {
@@ -223,19 +223,48 @@ impl Constraints {
                 g[j] -= r * delta;
             }
             if converged {
-                let mut w = Mat3::ZERO;
-                for (k, &(i, j, _)) in self.pairs.iter().enumerate() {
-                    let r = separation(cell, x[i], x[j]);
-                    let f = r * lambda[k];
-                    w += Mat3::from_cols(r * f.x, r * f.y, r * f.z);
-                }
-                return Ok(w);
+                return Ok((g, lambda));
             }
             if iteration + 1 == MAX_ITERATIONS {
                 break;
             }
         }
         Err(self.failure(x, cell, "constraint forces"))
+    }
+
+    /// Constraint virial W_c = Σ r_ij ⊗ g_ij (kJ/mol) of the exact instantaneous constraint
+    /// forces ([`Self::constraint_forces`]); independent of the integrator.
+    pub fn force_virial(
+        &self,
+        x: &[Vec3],
+        v: &[Vec3],
+        forces: &[Vec3],
+        inverse_masses: &[f64],
+        cell: Option<&Cell>,
+    ) -> Result<Mat3, ConstraintError> {
+        let (_, lambda) = self.constraint_forces(x, v, forces, inverse_masses, cell)?;
+        let mut w = Mat3::ZERO;
+        for (k, &(i, j, _)) in self.pairs.iter().enumerate() {
+            let r = separation(cell, x[i], x[j]);
+            let f = r * lambda[k];
+            w += Mat3::from_cols(r * f.x, r * f.y, r * f.z);
+        }
+        Ok(w)
+    }
+
+    /// Forces projected onto the constraint manifold (kJ/mol/nm): F + g with the constraint
+    /// forces of a state at rest, so that no constraint is accelerated. Zero projected forces mean
+    /// a constrained minimum (FIRE with constraints).
+    pub fn project_forces(
+        &self,
+        x: &[Vec3],
+        forces: &[Vec3],
+        inverse_masses: &[f64],
+        cell: Option<&Cell>,
+    ) -> Result<Vec<Vec3>, ConstraintError> {
+        let rest = vec![Vec3::ZERO; x.len()];
+        let (g, _) = self.constraint_forces(x, &rest, forces, inverse_masses, cell)?;
+        Ok(forces.iter().zip(&g).map(|(f, g)| *f + *g).collect())
     }
 
     fn failure(&self, x: &[Vec3], cell: Option<&Cell>, stage: &'static str) -> ConstraintError {
