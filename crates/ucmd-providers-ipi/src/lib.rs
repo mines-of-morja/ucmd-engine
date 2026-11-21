@@ -570,8 +570,7 @@ impl ForceProvider for IpiProvider {
                         None
                     };
                     if request.need_virial {
-                        let virial =
-                            mat3_from_row_major(virial.map(|value| hartree_to_kjmol(value)));
+                        let virial = mat3_from_row_major(virial.map(hartree_to_kjmol));
                         out.virial = Some(virial);
                     }
                     out.observables = parse_extras(&extras);
@@ -607,5 +606,142 @@ impl ForceProvider for IpiProvider {
         }
         self.listener = None;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ucmd_core::{AtomTemplate, MoleculeType};
+
+    fn system() -> System {
+        let atom = AtomTemplate {
+            name: "X".into(),
+            element: 0,
+            mass_amu: 1.0,
+            charge_e: None,
+            atom_type: None,
+        };
+        let molecule = MoleculeType {
+            name: "X".into(),
+            formal_charge_e: 0,
+            atoms: vec![atom],
+            bonds: Vec::new(),
+            angles: Vec::new(),
+            dihedrals: Vec::new(),
+            impropers: Vec::new(),
+            constraints: Vec::new(),
+        };
+        System::new("ipi-test", vec![molecule], &[(0, 1)], None, [false; 3]).unwrap()
+    }
+
+    #[test]
+    fn unit_conversions_use_core_constants() {
+        let bohr = nm_to_bohr(NM_PER_BOHR);
+        assert!((bohr - 1.0).abs() < 1.0e-15);
+        assert!((bohr_to_nm(1.0) - NM_PER_BOHR).abs() < 1.0e-15);
+        assert!((hartree_to_kjmol(1.0) - KJMOL_PER_HARTREE).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn json_extras_become_observables() {
+        let text = br#"{"dipole":[1.0,2.0],"spin":3.0}"#;
+        let mut extras = [0u8; 1024];
+        extras[..text.len()].copy_from_slice(text);
+        let observables = parse_extras(&extras);
+        assert_eq!(observables.len(), 2);
+        assert!(observables.iter().any(|value| {
+            value.name == "spin"
+                && value.value == ObservableValue::Scalar(3.0)
+                && value.unit.is_empty()
+        }));
+        assert!(observables.iter().any(|value| {
+            value.name == "dipole" && value.value == ObservableValue::Array(vec![1.0, 2.0])
+        }));
+    }
+
+    #[test]
+    fn unix_socket_round_trip() {
+        let path = std::env::temp_dir().join(format!("ucmd-ipi-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let client_path = path.clone();
+        let client = std::thread::spawn(move || -> Result<(), String> {
+            let mut stream = None;
+            for _ in 0..100 {
+                match UnixStream::connect(&client_path) {
+                    Ok(value) => {
+                        stream = Some(value);
+                        break;
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+            let mut stream =
+                stream.ok_or_else(|| "could not connect to i-PI Unix socket".to_string())?;
+            stream
+                .write_all(&header("STATUS"))
+                .map_err(|e| e.to_string())?;
+            let mut ready = [0u8; HEADER_BYTES];
+            stream.read_exact(&mut ready).map_err(|e| e.to_string())?;
+            if header_text(&ready) != "READY" {
+                return Err("missing READY handshake".into());
+            }
+
+            let mut incoming = [0u8; HEADER_BYTES];
+            stream
+                .read_exact(&mut incoming)
+                .map_err(|e| e.to_string())?;
+            if header_text(&incoming) != "POSDATA" {
+                return Err("missing POSDATA".into());
+            }
+            let mut packet = vec![0u8; 9 * 8 + 9 * 8 + 4 + 3 * 8];
+            stream.read_exact(&mut packet).map_err(|e| e.to_string())?;
+
+            stream
+                .write_all(&header("GETFORCE"))
+                .map_err(|e| e.to_string())?;
+            stream
+                .write_all(&1.0f64.to_ne_bytes())
+                .map_err(|e| e.to_string())?;
+            stream
+                .write_all(&1i32.to_ne_bytes())
+                .map_err(|e| e.to_string())?;
+            stream
+                .write_all(&0.25f64.to_ne_bytes())
+                .map_err(|e| e.to_string())?;
+            stream
+                .write_all(&0.5f64.to_ne_bytes())
+                .map_err(|e| e.to_string())?;
+            stream
+                .write_all(&(-0.25f64).to_ne_bytes())
+                .map_err(|e| e.to_string())?;
+            let virial = [0u8; 9 * 8];
+            stream.write_all(&virial).map_err(|e| e.to_string())?;
+            let mut extras = [0u8; 1024];
+            let text = br#"{"test":7.0}"#;
+            extras[..text.len()].copy_from_slice(text);
+            stream.write_all(&extras).map_err(|e| e.to_string())?;
+            Ok(())
+        });
+
+        let system = system();
+        let mut provider = IpiProvider::unix(path.clone()).with_timeout_ms(2_000);
+        provider.initialize(&system).unwrap();
+        let mut out = ForceResult::default();
+        provider
+            .evaluate(
+                &[Vec3::new(0.1, 0.2, 0.3)],
+                None,
+                &EvalRequest::everything(),
+                &mut out,
+            )
+            .unwrap();
+        client.join().unwrap().unwrap();
+        assert_eq!(out.forces.len(), 1);
+        assert!(out.energy.is_some());
+        assert!(out.virial.is_some());
+        assert_eq!(out.observables.len(), 1);
+        provider.finalize().unwrap();
+        let _ = std::fs::remove_file(path);
     }
 }
