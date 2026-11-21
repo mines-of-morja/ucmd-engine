@@ -1169,6 +1169,8 @@ dependencies = [
 name = "ucmd-providers-ipi"
 version = "0.0.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "ucmd-core",
  "ucmd-force",
 ]
