@@ -3,7 +3,8 @@
 The same terms and conventions as the engine's `force-field` provider (spec/system-package.md
 §5): harmonic bonds and angles, periodic / Ryckaert–Bellemans / OPLS-Fourier dihedrals, periodic
 and harmonic impropers, Lennard-Jones with the package's combination rule (plain cutoff or
-potential shift, optional tail correction), Coulomb with PME, scaled 1-4 pairs without cutoff.
+potential shift, optional tail correction counted as the engine counts it), Coulomb with PME,
+scaled 1-4 pairs without cutoff.
 PME uses the engine's α and grid (OpenMM's tolerance rules, computed here explicitly so that the
 GPU platform cannot choose a different grid).
 """
@@ -97,6 +98,30 @@ def _mix(top: Topology, i: int, j: int) -> tuple[float, float]:
     return sigma, math.sqrt(top.epsilon_kjmol[i] * top.epsilon_kjmol[j])
 
 
+def tail_weights(top: Topology) -> tuple[list[int], list[float], float]:
+    """Per atom its LJ class and that class's diagonal weight, and the off-diagonal weight, which
+    make OpenMM's long-range correction equal the engine's tail (2026-11-21).
+
+    The engine's tail is 2π/V Σ_ab n_a n_b ∫_rc^∞ r² u_ab(r) dr over the LJ types, with N²/2
+    pairs (Allen & Tildesley). OpenMM (CustomNonbondedForceImpl::calcLongRangeCorrection) counts
+    each pair of classes once, a class with itself n(n+1)/2 times, and scales the mean over
+    N(N+1)/2 pairs of all N atoms by N². Both agree for one type with LJ on every atom (argon)
+    and differ by O(1/N) otherwise: for SPC/Fw water, 1.3·10⁻³ of the tail (0.17 kJ/mol for 500
+    molecules, 6·10⁻⁶ of the conformance energy). Weights w_aa = n_a (N+1) / (N (n_a+1)) and
+    w_ab = (N+1)/N on the integrand of the class pair turn OpenMM's sum into the engine's.
+    Classes are distinct (σ, ε); the engine's formula does not change when types with equal
+    parameters are merged."""
+    keys = list(zip(top.sigma_nm.tolist(), top.epsilon_kjmol.tolist(), strict=True))
+    index: dict[tuple[float, float], int] = {}
+    cls = [index.setdefault(k, len(index)) for k in keys]
+    counts = [0] * len(index)
+    for c in cls:
+        counts[c] += 1
+    n = len(cls)
+    diagonal = [counts[c] * (n + 1) / (n * (counts[c] + 1)) for c in cls]
+    return cls, diagonal, (n + 1) / n
+
+
 def build_system(top: Topology, s: NonbondedSettings) -> tuple[mm.System, dict]:
     """The OpenMM System and a description of the electrostatics, for provenance."""
     periodic = top.cell_nm is not None
@@ -149,11 +174,26 @@ def build_system(top: Topology, s: NonbondedSettings) -> tuple[mm.System, dict]:
         else "sig=0.5*(sig1+sig2); eps=sqrt(eps1*eps2)"
     )
     shift = " - 4*eps*((sig/rc)^12-(sig/rc)^6)" if s.lj_cutoff_mode == "potential-shift" else ""
-    lj = mm.CustomNonbondedForce(f"4*eps*((sig/r)^12-(sig/r)^6){shift}; {mix}")
+    energy = f"4*eps*((sig/r)^12-(sig/r)^6){shift}"
+    if s.dispersion_correction:
+        if not periodic:
+            raise ModelError("the tail correction needs a periodic package")
+        # inside the cutoff the factor is exactly 1; only OpenMM's integral of the tail beyond
+        # it sees the class-pair weights (tail_weights)
+        energy = f"({energy})*(1 + step(r - rc)*(w - 1)); w = select(delta(cls1 - cls2), wd1, wo)"
+    lj = mm.CustomNonbondedForce(f"{energy}; {mix}")
     lj.addPerParticleParameter("sig")
     lj.addPerParticleParameter("eps")
-    for sg, ep in zip(top.sigma_nm, top.epsilon_kjmol, strict=True):
-        lj.addParticle([float(sg), float(ep)])
+    if s.dispersion_correction:
+        lj.addPerParticleParameter("cls")
+        lj.addPerParticleParameter("wd")
+        cls, diagonal, off_diagonal = tail_weights(top)
+        lj.addGlobalParameter("wo", off_diagonal)
+        for sg, ep, c, wd in zip(top.sigma_nm, top.epsilon_kjmol, cls, diagonal, strict=True):
+            lj.addParticle([float(sg), float(ep), float(c), wd])
+    else:
+        for sg, ep in zip(top.sigma_nm, top.epsilon_kjmol, strict=True):
+            lj.addParticle([float(sg), float(ep)])
     for i, j in (*top.excluded, *top.pairs14):
         lj.addExclusion(i, j)
     lj.setUseLongRangeCorrection(s.dispersion_correction)

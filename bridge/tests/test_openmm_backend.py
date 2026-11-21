@@ -175,6 +175,35 @@ def test_charged_crystal_with_pme_agrees(tmp_path: Path) -> None:
     assert float(line.split("forces ")[1].split(" ")[0]) < 1e-6
 
 
+def test_the_tail_correction_of_several_types_agrees(tmp_path: Path) -> None:
+    """2026-11-21, SPC/Fw water on HIP: the conformance energy failed by 6.3e-6 in double precision
+    (forces 7.6e-8). OpenMM's long-range correction counts N(N+1)/2 pairs over all atoms,
+    including those without LJ; the engine's is 2π/V Σ_ab n_a n_b ∫ r² u_ab (Allen & Tildesley).
+    The two agree for one type (argon) and differ by O(1/N) otherwise. The bridge must reproduce
+    the engine's tail. Two SPC/Fw molecules in a periodic 2 nm box: 2 O with LJ among 6 atoms,
+    where OpenMM's own count gives a tail (n_O + 1)/n_O · N/(N + 1) = 1.29 times the engine's."""
+    text = (
+        ARGON.format(steps=20, thermostat="nose-hoover-chain")
+        .replace("temperature_K = 94.4", "temperature_K = 300.0")
+        .replace(
+            "cutoff_nm = 0.85\ndispersion_correction = true",
+            'cutoff_nm = 0.6\ncoulomb = "pme"\ndispersion_correction = true',
+        )
+        .replace("timestep_fs = 4.0", "timestep_fs = 0.5")
+    )
+    profile = setup_run(tmp_path, "water-2", text)
+    doc_path = tmp_path / "system.ucsys/system.json"
+    doc = json.loads(doc_path.read_text())
+    doc["periodicity"], doc["cell_nm"] = [True] * 3, [[2.0, 0, 0], [0, 2.0, 0], [0, 0, 2.0]]
+    doc_path.write_text(json.dumps(doc))
+    r = ucmd(tmp_path, profile)
+    assert r.returncode == 0, r.stderr
+    line = next(x for x in r.stderr.splitlines() if "conformance with" in x)
+    # the tail is -0.013 kJ/mol here, OpenMM's own count off by 0.004 kJ/mol (2e-4 of the
+    # energy); OpenMM integrates the custom tail numerically to about 3e-7 of itself
+    assert float(line.split("energy ")[1].split(",")[0]) < 1e-8
+
+
 def test_csvr_and_a_wrong_model_are_refused(tmp_path: Path) -> None:
     profile = setup_run(tmp_path, "argon-864", ARGON.format(steps=20, thermostat="csvr"))
     r = ucmd(tmp_path, profile)
