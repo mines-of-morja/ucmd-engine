@@ -55,9 +55,18 @@ MAGIC = b"UCMDOMM1\n"
 # mixed precision itself is admitted by a statistical comparison with double precision.
 FORCE_TOLERANCE = {"double": None, "mixed": 2e-4, "single": 2e-4}
 SYMBOL = {z: s for s, z in ATOMIC_NUMBER.items()}
-# Molecule identity (identity.py): positions are read at least this often, OpenMM's reorder
-# interval, so at most one reorder lies between two reads and molecules move ≪ 0.2 nm.
+# Molecule identity (identity.py): positions are read at least every 250 steps, OpenMM's reorder
+# interval, so at most one reorder lies between two reads, and at least every 0.1 ps, so that
+# molecules move ≪ 0.2 nm between reads. The time limit matters for light, fast molecules:
+# SPC/Fw water read every 0.25 ps (250 steps of 1 fs) failed the ambiguity check within the
+# first ps (2026-11-21), every 0.125 ps (0.5 fs) ran 250 ps without a label correction.
 TRACK_EVERY_STEPS = 250
+TRACK_EVERY_PS = 0.1
+
+
+def track_every_steps(dt_ps: float) -> int:
+    """Steps between two position reads for identity tracking (≥ 1)."""
+    return max(1, min(TRACK_EVERY_STEPS, int(TRACK_EVERY_PS / dt_ps + 1e-9)))
 
 
 class ConfigError(ValueError):
@@ -261,6 +270,7 @@ def run(args: argparse.Namespace) -> int:
 
     started = time.perf_counter()
     plan = read_plan(Path(args.run_toml))
+    track_steps = track_every_steps(plan.dt_ps)
     top: Topology = load_package(system_path(plan))
     settings = NonbondedSettings.from_provider(plan.provider)
     system, electrostatics = build_system(top, settings)
@@ -378,7 +388,7 @@ def run(args: argparse.Namespace) -> int:
             f"tolerance {constraint_tolerance:g}"
             if constrained
             else "none",
-            "identity_tracking": f"positions read every {TRACK_EVERY_STEPS} steps; molecules "
+            "identity_tracking": f"positions read every {track_steps} steps; molecules "
             f"matched by atom RMSD, limit {DEFAULT_MAX_MOVE_NM} nm (identity.py)",
             **environment(),
             **{k: v for k, v in check.items() if isinstance(v, (int, float, str))},
@@ -429,7 +439,7 @@ def run(args: argparse.Namespace) -> int:
 
     def observe(s: int, last_good: list) -> None:
         need_traj = bool(every["trajectory"]) and s % every["trajectory"] == 0
-        need_pos = need_traj or s % TRACK_EVERY_STEPS == 0
+        need_pos = need_traj or s % track_steps == 0
         state = context.getState(getEnergy=True, getPositions=need_pos, enforcePeriodicBox=False)
         k = state.getKineticEnergy().value_in_unit(unit.kilojoule_per_mole)
         u = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
@@ -489,7 +499,7 @@ def run(args: argparse.Namespace) -> int:
     try:
         if restart_step is None:
             observe(step, last_good)
-        events = [e for e in (*every.values(), pressure_every, TRACK_EVERY_STEPS) if e]
+        events = [e for e in (*every.values(), pressure_every, track_steps) if e]
         while step < plan.steps and stop.signal is None:
             nxt = min([plan.steps, *((step // e + 1) * e for e in events)])
             integrator.step(nxt - step)

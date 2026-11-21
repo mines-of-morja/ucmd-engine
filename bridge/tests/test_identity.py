@@ -237,3 +237,15 @@ def test_strict_mode_keeps_labels_of_fast_neighbours_without_a_relabelling() -> 
     z[b] = y[b] + [0.25, 0.0, 0.0]
     with pytest.raises(IdentityError, match="ambiguous"):
         tracker.update(z)
+
+
+def test_position_reads_are_at_most_0_1_ps_and_250_steps_apart() -> None:
+    """SPC/Fw water at 1 fs read every 250 steps (0.25 ps) failed the ambiguity check within the
+    first ps (2026-11-21); the same water at 0.5 fs (0.125 ps) ran 250 ps."""
+    from ucmd_bridge.openmm_backend import track_every_steps
+
+    assert track_every_steps(0.001) == 100  # 1 fs: water, EC, electrolytes
+    assert track_every_steps(0.0005) == 200
+    assert track_every_steps(0.0002) == 250  # 0.2 fs: capped by OpenMM's reorder interval
+    assert track_every_steps(0.004) == 25  # argon at 4 fs
+    assert track_every_steps(0.5) == 1  # a step longer than the interval: every step
