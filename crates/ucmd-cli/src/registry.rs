@@ -9,12 +9,14 @@ use ucmd_providers_classical::{
     Bonded, ForceField, HarmonicTether, LennardJones, LennardJonesConfig, Nonbonded,
     NonbondedConfig,
 };
+use ucmd_providers_ipi::{IpiProvider, IpiProviderConfig};
 
 /// The provider kinds this build knows.
-pub const KINDS: [&str; 5] = [
+pub const KINDS: [&str; 6] = [
     "bonded",
     "force-field",
     "harmonic-tether",
+    "i-pi",
     "lennard-jones",
     "nonbonded",
 ];
@@ -51,6 +53,11 @@ pub fn make_provider(table: &toml::Table, initial: &State) -> Result<Box<dyn For
                 .try_into()
                 .context("[[providers]] kind = \"lennard-jones\"")?;
             Ok(Box::new(LennardJones::new(config)))
+        }
+        "i-pi" | "ipi" => {
+            let config: IpiProviderConfig =
+                value.try_into().context("[[providers]] kind = \"i-pi\"")?;
+            Ok(Box::new(IpiProvider::new(config)))
         }
         "harmonic-tether" => {
             #[derive(serde::Deserialize)]
