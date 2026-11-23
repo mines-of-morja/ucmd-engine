@@ -239,13 +239,30 @@ def test_strict_mode_keeps_labels_of_fast_neighbours_without_a_relabelling() -> 
         tracker.update(z)
 
 
-def test_position_reads_are_at_most_0_1_ps_and_250_steps_apart() -> None:
+def test_position_reads_are_at_most_0_025_ps_and_250_steps_apart() -> None:
     """SPC/Fw water at 1 fs read every 250 steps (0.25 ps) failed the ambiguity check within the
-    first ps (2026-11-21); the same water at 0.5 fs (0.125 ps) ran 250 ps."""
+    first ps (2026-11-21); at 0.1 ps it failed 3 of 3 NVT starts (2026-11-23)."""
     from ucmd_bridge.openmm_backend import track_every_steps
 
-    assert track_every_steps(0.001) == 100  # 1 fs: water, EC, electrolytes
-    assert track_every_steps(0.0005) == 200
-    assert track_every_steps(0.0002) == 250  # 0.2 fs: capped by OpenMM's reorder interval
-    assert track_every_steps(0.004) == 25  # argon at 4 fs
+    assert track_every_steps(0.001) == 25  # 1 fs: water, EC, electrolytes
+    assert track_every_steps(0.0005) == 50
+    assert track_every_steps(0.0001) == 250  # 0.1 fs: capped by OpenMM's reorder interval
+    assert track_every_steps(0.004) == 6  # argon at 4 fs
     assert track_every_steps(0.5) == 1  # a step longer than the interval: every step
+
+
+def test_the_first_ps_are_read_more_often() -> None:
+    """Study 2026-11-23_water-pressure-vs-density: three of three NVT starts of 512 SPC/Fw water
+    (packed, minimized, thermostat τ = 1 ps) failed the ambiguity check at 2.6, 3.6 and (after a 5 ps warm-up) 5.1 ps with
+    reads every 0.1 ps. The start is violent for a few ps; reading every 0.01 ps then costs 500
+    position transfers, and kept the worst nearest / second-nearest ratio at 0.13."""
+    from ucmd_bridge.openmm_backend import TRACK_WARMUP_PS, track_every_steps
+
+    assert TRACK_WARMUP_PS == 5.0
+    assert track_every_steps(0.001, 0.0) == 10
+    assert track_every_steps(0.001, 4.99) == 10
+    assert track_every_steps(0.001, 5.0) == 25  # afterwards the steady-state cadence
+    assert track_every_steps(0.001) == 25  # no time given: the steady-state cadence
+    assert track_every_steps(0.0005, 1.0) == 20
+    assert track_every_steps(0.004, 1.0) == 2
+    assert track_every_steps(0.5, 1.0) == 1

@@ -56,17 +56,28 @@ MAGIC = b"UCMDOMM1\n"
 FORCE_TOLERANCE = {"double": None, "mixed": 2e-4, "single": 2e-4}
 SYMBOL = {z: s for s, z in ATOMIC_NUMBER.items()}
 # Molecule identity (identity.py): positions are read at least every 250 steps, OpenMM's reorder
-# interval, so at most one reorder lies between two reads, and at least every 0.1 ps, so that
-# molecules move ≪ 0.2 nm between reads. The time limit matters for light, fast molecules:
-# SPC/Fw water read every 0.25 ps (250 steps of 1 fs) failed the ambiguity check within the
-# first ps (2026-11-21), every 0.125 ps (0.5 fs) ran 250 ps without a label correction.
+# interval, so at most one reorder lies between two reads, and at least every 0.025 ps, so that
+# two neighbouring identical molecules cannot be confused after a reorder. The time limit matters
+# for light, fast molecules (a swap of two water molecules 0.28 nm apart is ambiguous once each
+# has moved about 0.15 nm): SPC/Fw water read every 0.25 ps failed the ambiguity check within the
+# first ps (2026-11-21), every 0.125 ps ran 250 ps without a label correction, every 0.1 ps ran
+# the NPT start of rung W but failed 3 of 3 NVT starts at 2.6, 3.6 and 5.1 ps (2026-11-23).
 TRACK_EVERY_STEPS = 250
-TRACK_EVERY_PS = 0.1
+TRACK_EVERY_PS = 0.025
+# The start of a run from a packed and minimized box is violent for a few ps: two of three NVT
+# starts of 512 SPC/Fw water failed the ambiguity check at 2.6 and 3.6 ps with reads every
+# 0.1 ps (2026-11-23). During the first TRACK_WARMUP_PS the positions are read ten times as
+# often (about 500 reads of a few thousand atoms, negligible against the run).
+TRACK_WARMUP_PS = 5.0
+TRACK_WARMUP_EVERY_PS = 0.01
 
 
-def track_every_steps(dt_ps: float) -> int:
-    """Steps between two position reads for identity tracking (≥ 1)."""
-    return max(1, min(TRACK_EVERY_STEPS, int(TRACK_EVERY_PS / dt_ps + 1e-9)))
+def track_every_steps(dt_ps: float, time_ps: float | None = None) -> int:
+    """Steps between two position reads for identity tracking (≥ 1). With `time_ps` inside the
+    warm-up (the first TRACK_WARMUP_PS of the run) the interval is ten times shorter."""
+    warm = time_ps is not None and time_ps < TRACK_WARMUP_PS - 1e-9
+    every_ps = TRACK_WARMUP_EVERY_PS if warm else TRACK_EVERY_PS
+    return max(1, min(TRACK_EVERY_STEPS, int(every_ps / dt_ps + 1e-9)))
 
 
 class ConfigError(ValueError):
@@ -388,8 +399,9 @@ def run(args: argparse.Namespace) -> int:
             f"tolerance {constraint_tolerance:g}"
             if constrained
             else "none",
-            "identity_tracking": f"positions read every {track_steps} steps; molecules "
-            f"matched by atom RMSD, limit {DEFAULT_MAX_MOVE_NM} nm (identity.py)",
+            "identity_tracking": f"positions read every {track_steps} steps (every "
+            f"{track_every_steps(plan.dt_ps, 0.0)} during the first {TRACK_WARMUP_PS:g} ps); "
+            f"molecules matched by atom RMSD, limit {DEFAULT_MAX_MOVE_NM} nm (identity.py)",
             **environment(),
             **{k: v for k, v in check.items() if isinstance(v, (int, float, str))},
         },
@@ -439,7 +451,7 @@ def run(args: argparse.Namespace) -> int:
 
     def observe(s: int, last_good: list) -> None:
         need_traj = bool(every["trajectory"]) and s % every["trajectory"] == 0
-        need_pos = need_traj or s % track_steps == 0
+        need_pos = need_traj or s % track_every_steps(plan.dt_ps, s * plan.dt_ps) == 0
         state = context.getState(getEnergy=True, getPositions=need_pos, enforcePeriodicBox=False)
         k = state.getKineticEnergy().value_in_unit(unit.kilojoule_per_mole)
         u = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
@@ -499,9 +511,10 @@ def run(args: argparse.Namespace) -> int:
     try:
         if restart_step is None:
             observe(step, last_good)
-        events = [e for e in (*every.values(), pressure_every, track_steps) if e]
+        events = [e for e in (*every.values(), pressure_every) if e]
         while step < plan.steps and stop.signal is None:
-            nxt = min([plan.steps, *((step // e + 1) * e for e in events)])
+            events_now = [*events, track_every_steps(plan.dt_ps, step * plan.dt_ps)]
+            nxt = min([plan.steps, *((step // e + 1) * e for e in events_now)])
             integrator.step(nxt - step)
             step = nxt
             observe(step, last_good)
