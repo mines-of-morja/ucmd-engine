@@ -16,8 +16,10 @@
   isothermal-isobaric ensemble, validated for argon in validation/npt-argon). CSVR: refused.
 - **Pressure:** OpenMM has no virial. The thermo column holds the molecular pressure of
   MonteCarloBarostat.computeCurrentPressure every `--pressure-every` steps (a numerical volume
-  derivative, about 70 ms each), and nan in between. Its mean equals the atomic virial pressure
-  in equilibrium; its fluctuations are smaller.
+  derivative, about 70 ms each), and nan in between. It is evaluated on the current state in a
+  second context that never steps (pressure.py): asked of the stepping GPU context the value
+  drifted upward at fixed volume (study 2026-11-23_water-pressure-vs-density). Its mean equals
+  the atomic virial pressure in equilibrium; its fluctuations are smaller.
 - **Outputs** in the spec formats (thermo table, H5MD or extended XYZ), restartable from this
   backend's own checkpoint file (OpenMM's checkpoint behind a JSON header). SIGINT/SIGTERM stop
   gracefully with a checkpoint and exit status 128 + signal.
@@ -46,6 +48,7 @@ from .integrators import bath_energy, langevin_baoab, nose_hoover_chain, velocit
 from .model import ModelError, NonbondedSettings, build_system
 from .package import ATOMIC_NUMBER, Topology
 from .package import load as load_package
+from .pressure import PressureProbe
 
 BOLTZMANN_KJMOL_K = 1.380649e-23 * 6.02214076e23 / 1000.0  # CODATA 2018, exact
 BAR_PER_KJMOL_NM3 = 1e25 / 6.02214076e23
@@ -332,6 +335,7 @@ def run(args: argparse.Namespace) -> int:
         if args.device is not None:
             properties["DeviceIndex"] = args.device
     context = mm.Context(system, integrator, platform, properties)
+    probe = PressureProbe(system, barostat, platform, properties) if barostat is not None else None
     device = ""
     for name in ("DeviceName", "OpenCLPlatformName"):
         with contextlib.suppress(Exception):
@@ -394,7 +398,8 @@ def run(args: argparse.Namespace) -> int:
             "device": device.strip(),
             "electrostatics": json.dumps(electrostatics),
             "barostat": "MonteCarloBarostat" if plan.barostat else "none",
-            "pressure": "molecular, MonteCarloBarostat.computeCurrentPressure",
+            "pressure": "molecular, MonteCarloBarostat.computeCurrentPressure in a second context "
+            "that never steps (pressure.py)",
             "constraints": f"{len(top.constraints)}, RATTLE in the CustomIntegrator, relative "
             f"tolerance {constraint_tolerance:g}"
             if constrained
@@ -451,8 +456,11 @@ def run(args: argparse.Namespace) -> int:
 
     def observe(s: int, last_good: list) -> None:
         need_traj = bool(every["trajectory"]) and s % every["trajectory"] == 0
-        need_pos = need_traj or s % track_every_steps(plan.dt_ps, s * plan.dt_ps) == 0
-        state = context.getState(getEnergy=True, getPositions=need_pos, enforcePeriodicBox=False)
+        need_p = probe is not None and bool(pressure_every) and s % pressure_every == 0
+        need_pos = need_traj or need_p or s % track_every_steps(plan.dt_ps, s * plan.dt_ps) == 0
+        state = context.getState(
+            getEnergy=True, getPositions=need_pos, getVelocities=need_p, enforcePeriodicBox=False
+        )
         k = state.getKineticEnergy().value_in_unit(unit.kilojoule_per_mole)
         u = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
         t_ps = state.getTime().value_in_unit(unit.picosecond)
@@ -468,9 +476,12 @@ def run(args: argparse.Namespace) -> int:
         if plan.barostat is not None and volume is not None:
             conserved += p0_kjmol_nm3 * volume
         pressure = None
-        if barostat is not None and pressure_every and s % pressure_every == 0:
-            value = barostat.computeCurrentPressure(context)  # a Quantity in newer OpenMM
-            pressure = float(value.value_in_unit(unit.bar) if hasattr(value, "unit") else value)
+        if need_p:  # in a context that never steps (pressure.py), not in the stepping one
+            pressure = probe(
+                state.getPositions(asNumpy=True),
+                state.getVelocities(asNumpy=True),
+                state.getPeriodicBoxVectors(),
+            )
         row = {
             "step": s, "time_ps": t_ps, "potential_kjmol": u, "kinetic_kjmol": k,
             "total_kjmol": k + u, "conserved_energy_kjmol": conserved,

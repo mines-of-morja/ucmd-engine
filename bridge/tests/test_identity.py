@@ -253,9 +253,10 @@ def test_position_reads_are_at_most_0_025_ps_and_250_steps_apart() -> None:
 
 def test_the_first_ps_are_read_more_often() -> None:
     """Study 2026-11-23_water-pressure-vs-density: three of three NVT starts of 512 SPC/Fw water
-    (packed, minimized, thermostat τ = 1 ps) failed the ambiguity check at 2.6, 3.6 and (after a 5 ps warm-up) 5.1 ps with
-    reads every 0.1 ps. The start is violent for a few ps; reading every 0.01 ps then costs 500
-    position transfers, and kept the worst nearest / second-nearest ratio at 0.13."""
+    (packed, minimized, thermostat τ = 1 ps) failed the ambiguity check at 2.6, 3.6 and (after a
+    5 ps warm-up) 5.1 ps with reads every 0.1 ps. The start is violent for a few ps; reading
+    every 0.01 ps then costs 500 position transfers, and kept the worst nearest / second-nearest
+    ratio at 0.13."""
     from ucmd_bridge.openmm_backend import TRACK_WARMUP_PS, track_every_steps
 
     assert TRACK_WARMUP_PS == 5.0
