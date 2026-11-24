@@ -286,6 +286,109 @@ def test_the_nose_hoover_chain_is_the_engines(tmp_path: Path) -> None:
         assert np.allclose(gpu[:, k], cpu[:, k], rtol=1e-6), column
 
 
+def _nve_with_vectors(steps: int, every: int) -> str:
+    """Argon NVE with velocities and forces in the trajectory, from the package's velocities."""
+    text = (
+        ARGON.format(steps=steps, thermostat="nose-hoover-chain")
+        .replace('[velocities]\ngenerate = "maxwell-boltzmann"\ntemperature_K = 94.4\n\n', "")
+        .replace(
+            '[thermostat]\nkind = "nose-hoover-chain"\ntemperature_K = 94.4\ntau_ps = 0.5\n\n', ""
+        )
+        .replace("every = 50", f"every = {every}\nvelocities = true\nforces = true")
+    )
+    assert "[thermostat]" not in text and "[velocities]" not in text and "forces = true" in text
+    return text
+
+
+def test_velocities_and_forces_are_the_engines(tmp_path: Path) -> None:
+    """[output.trajectory] velocities and forces: from the same start the bridge writes the same
+    full-step velocities and forces as the CPU engine, in the spec's datasets."""
+    import h5py
+    from ucmd_spec.trajectory import validate_trajectory
+
+    text = _nve_with_vectors(steps=40, every=10)
+    rng = np.random.default_rng(3)
+    for name in ("cpu", "openmm"):
+        d = tmp_path / name
+        d.mkdir()
+        profile = setup_run(d, "argon-864", text)
+        v = rng.normal(0.0, 0.14, (864, 3)) if name == "cpu" else np.load(tmp_path / "cpu/v.npy")
+        v -= v.mean(0)
+        np.save(d / "system.ucsys/velocities.npy", v)
+        np.save(d / "v.npy", v)
+        if name == "cpu":
+            profile.write_text("threads = 1\n")
+        r = ucmd(d, profile)
+        assert r.returncode == 0, r.stderr
+    report = validate_trajectory(tmp_path / "openmm/out/trajectory.h5")
+    assert report.ok, report.issues
+    with (
+        h5py.File(tmp_path / "cpu/out/trajectory.h5") as cpu,
+        h5py.File(tmp_path / "openmm/out/trajectory.h5") as omm,
+    ):
+        for name, unit in (("velocity", "nm ps-1"), ("force", "kJ mol-1 nm-1")):
+            a, b = cpu[f"particles/all/{name}"], omm[f"particles/all/{name}"]
+            assert b["value"].attrs["unit"] == a["value"].attrs["unit"] == unit
+            assert b["step"][()].tolist() == a["step"][()].tolist() == [0, 10, 20, 30, 40]
+            x, y = a["value"][()], b["value"][()]
+            worst = np.abs(x - y).max() / np.abs(x).max()
+            print(f"{name}: worst difference {worst:.1e} of the largest component")
+            assert worst < 1e-6
+        # the stored velocities are those of the logged kinetic energy (full step)
+        m = omm["particles/all/mass"][()]
+        v = omm["particles/all/velocity/value"][()]
+        k = 0.5 * (m[None, :, None] * v**2).sum((1, 2))
+        assert np.allclose(k, omm["observables/kinetic_energy/value"][()], rtol=1e-12)
+
+
+def test_velocities_restart_and_need_their_dataset(tmp_path: Path) -> None:
+    """A restart cuts and continues the velocity series; one that asks for velocities in a file
+    without them is refused instead of writing a partial series."""
+    import h5py
+
+    text = ARGON.format(steps=100, thermostat="nose-hoover-chain")
+    with_v = text.replace("every = 50", "every = 50\nvelocities = true")
+    profile = setup_run(tmp_path, "argon-864", with_v)
+    assert ucmd(tmp_path, profile).returncode == 0
+    (tmp_path / "run.toml").write_text(with_v.replace("steps = 100", "steps = 200"))
+    r = ucmd(tmp_path, profile, "--restart", "out/checkpoint.ucchk")
+    assert r.returncode == 0, r.stderr
+    with h5py.File(tmp_path / "out/trajectory.h5", "a") as fh:
+        g = fh["particles/all/velocity"]
+        assert g["step"][()].tolist() == [0, 50, 100, 150, 200]
+        assert g["value"].shape == (5, 864, 3) and np.abs(g["value"][4]).max() > 0
+        del fh["particles/all/velocity"]
+    (tmp_path / "run.toml").write_text(with_v.replace("steps = 100", "steps = 300"))
+    r = ucmd(tmp_path, profile, "--restart", "out/checkpoint.ucchk")
+    assert r.returncode != 0 and "velocity" in r.stderr, r.stderr
+    assert "Traceback" not in r.stderr, r.stderr
+
+
+def test_an_xyz_trajectory_is_written(tmp_path: Path) -> None:
+    """Every .xyz run failed at its first frame (XyzWriter.write was called with the thermo row)."""
+    text = ARGON.format(steps=20, thermostat="nose-hoover-chain").replace(
+        'file = "trajectory.h5"\nevery = 50', 'file = "t.xyz"\nevery = 10'
+    )
+    profile = setup_run(tmp_path, "argon-864", text)
+    r = ucmd(tmp_path, profile)
+    assert r.returncode == 0, r.stderr
+    lines = (tmp_path / "out/t.xyz").read_text().splitlines()
+    assert len(lines) == 3 * 866 and [int(x) for x in lines[::866]] == [864] * 3
+
+
+@pytest.mark.parametrize("key", ["velocities", "forces"])
+def test_an_xyz_trajectory_refuses_velocities_and_forces(tmp_path: Path, key: str) -> None:
+    """The viewer format holds positions only; the request must not be dropped (invariant 7)."""
+    text = ARGON.format(steps=20, thermostat="nose-hoover-chain").replace(
+        'file = "trajectory.h5"\nevery = 50', f'file = "t.xyz"\nevery = 10\n{key} = true'
+    )
+    assert f"{key} = true" in text
+    profile = setup_run(tmp_path, "argon-864", text)
+    r = ucmd(tmp_path, profile)
+    assert r.returncode != 0 and "E_UNSUPPORTED" in r.stderr and key in r.stderr, r.stderr
+    assert not (tmp_path / "out/t.xyz").exists()
+
+
 def test_mixed_precision_needs_a_thermostat(tmp_path: Path) -> None:
     """ADR 0012: mixed precision for thermostatted production runs only; NVE runs use double."""
     text = ARGON.format(steps=20, thermostat="nose-hoover-chain").replace(

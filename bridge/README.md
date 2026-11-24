@@ -27,6 +27,8 @@ Then `ucmd run run.toml` works as usual, from the shell, the study driver or the
    Nosé–Hoover chain, Langevin BAOAB, all with full-step velocities. C-rescale becomes
    MonteCarloBarostat (same ensemble).
 5. It writes the spec's thermo table and H5MD or XYZ trajectory, and its own checkpoint.
+   `velocities = true` and `forces = true` add those series to an H5MD trajectory (full-step, in
+   canonical order); with an XYZ trajectory they are refused (`E_UNSUPPORTED`).
 6. It writes positions in canonical order. On the GPU, OpenMM's output exchanged identical
    molecules (pilot of 2026-11-20); `identity.py` tracks the molecules every 250 steps and
    undoes it. An ambiguous match stops the run (see `validation/e37-identity`).

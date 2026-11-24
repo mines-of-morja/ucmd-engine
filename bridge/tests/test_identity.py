@@ -55,6 +55,20 @@ def test_swaps_within_types_are_undone_exactly() -> None:
     assert swaps > 10 and tracker.exchanges > 0
 
 
+def test_velocities_of_the_same_read_follow_the_relabelling() -> None:
+    """The backend writes velocities as raw[tracker.perm] after the position update of the same
+    state; a swap must not give a molecule its neighbour's velocity."""
+    rng = np.random.default_rng(7)
+    mol, x = _system(rng)
+    v = rng.normal(0.0, 0.5, x.shape)
+    tracker = Tracker(mol, TYPES)
+    tracker.update(x)
+    p = _swap(rng, mol, 6)
+    assert np.any(p != np.arange(len(p)))
+    assert np.array_equal(tracker.update(x[p]), x)
+    assert np.array_equal(v[p][tracker.perm], v)
+
+
 def test_box_images_travel_with_the_molecules() -> None:
     rng = np.random.default_rng(1)
     mol, x = _system(rng)
