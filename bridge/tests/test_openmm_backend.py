@@ -236,6 +236,42 @@ def test_the_pressure_tensor_is_refused(tmp_path: Path) -> None:
     assert not (tmp_path / "out/thermo.tsv").exists()
 
 
+def test_the_molecular_pressure_column(tmp_path: Path) -> None:
+    """Spec 0.1.3: [output.thermo] pressure_molecular adds the last column. OpenMM's pressure is
+    molecular, so it repeats pressure_bar, NaN rows included; a run that cannot compute a pressure
+    is refused before it starts."""
+    text = ARGON.format(steps=20, thermostat="nose-hoover-chain").replace(
+        '[output.thermo]\nfile = "thermo.tsv"\nevery = 10\n',
+        '[output.thermo]\nfile = "thermo.tsv"\nevery = 10\npressure_molecular = true\n',
+    )
+    assert "pressure_molecular = true" in text
+    profile = setup_run(tmp_path, "argon-864", text.replace('"0.1.0"', '"0.1.3"', 1))
+    r = ucmd(tmp_path, profile)
+    assert r.returncode == 0, r.stderr
+    names, rows = thermo(tmp_path)
+    assert names[-1] == "pressure_molecular_bar"
+    p = rows[:, names.index("pressure_bar")]
+    assert np.isfinite(p[0])
+    np.testing.assert_array_equal(rows[:, -1], p)
+
+
+def test_the_molecular_pressure_without_a_pressure_is_refused(tmp_path: Path) -> None:
+    """With --pressure-every 0 the column would hold only NaN: the run must not start."""
+    import argparse
+
+    from ucmd_bridge import openmm_backend
+
+    text = ARGON.format(steps=20, thermostat="nose-hoover-chain").replace(
+        '[output.thermo]\nfile = "thermo.tsv"\nevery = 10\n',
+        '[output.thermo]\nfile = "thermo.tsv"\nevery = 10\npressure_molecular = true\n',
+    )
+    setup_run(tmp_path, "argon-864", text.replace('"0.1.0"', '"0.1.3"', 1))
+    args = argparse.Namespace(run_toml=str(tmp_path / "run.toml"), pressure_every=0)
+    with pytest.raises(openmm_backend.ConfigError, match="E_UNSUPPORTED"):
+        openmm_backend.run(args)
+    assert not (tmp_path / "out/thermo.tsv").exists()
+
+
 def test_sigterm_stops_gracefully_with_a_checkpoint(tmp_path: Path) -> None:
     profile = setup_run(
         tmp_path, "argon-864", ARGON.format(steps=500000, thermostat="nose-hoover-chain")

@@ -154,6 +154,7 @@ mod tests {
                     temperature_k: 0.0,
                     conserved_energy: None,
                     pressure_bar: None,
+                    molecular_pressure_bar: None,
                 })
                 .unwrap();
             let text = std::fs::read_to_string(&path).unwrap();

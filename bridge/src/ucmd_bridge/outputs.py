@@ -34,8 +34,13 @@ def _num(x: float | None) -> str:
 class ThermoWriter:
     """The thermo table of spec/run-config.md (tab-separated, one flushed line per row)."""
 
-    def __init__(self, path: Path, restart_step: int | None) -> None:
+    def __init__(
+        self, path: Path, restart_step: int | None, pressure_molecular: bool = False
+    ) -> None:
         self.path = path
+        self.columns = THERMO_COLUMNS
+        if pressure_molecular:  # spec 0.1.3; the last column
+            self.columns += ("pressure_molecular_bar",)
         if restart_step is not None and path.is_file():
             kept = []
             for line in path.read_text().splitlines(keepends=True):
@@ -45,12 +50,12 @@ class ThermoWriter:
             self.fh = path.open("a")
         else:
             self.fh = path.open("w")
-            self.fh.write("# " + "\t".join(THERMO_COLUMNS) + "\n")
+            self.fh.write("# " + "\t".join(self.columns) + "\n")
         self.fh.flush()
 
     def write(self, row: dict) -> None:
         cells = [str(row["step"]), f"{row['time_ps']:.6f}"]
-        for key in THERMO_COLUMNS[2:]:
+        for key in self.columns[2:]:
             value = row.get(key)
             cells.append(f"{value:.6f}" if key == "temperature_K" and value is not None
                          else _num(value))  # fmt: skip

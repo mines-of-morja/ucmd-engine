@@ -776,6 +776,10 @@ impl<P: ForceProvider> Dynamics<P> {
             )),
             _ => None,
         };
+        let molecular_pressure_bar = match (self.forces.virial, cell) {
+            (Some(w), Some(c)) => Some(self.scaling_pressure(w, c.volume()).1),
+            _ => None,
+        };
         Snapshot {
             step: self.state.step,
             time_ps: self.state.time_ps,
@@ -787,6 +791,7 @@ impl<P: ForceProvider> Dynamics<P> {
             temperature_k: self.temperature(),
             conserved_energy: self.conserved_energy(),
             pressure_bar,
+            molecular_pressure_bar,
         }
     }
 
@@ -2305,6 +2310,9 @@ mod tests {
                 two_k += total * ((v[0] * mass[0] + v[1] * mass[1]) / total).length_squared();
             }
             worst = worst.max((p / (two_k * bar) - 1.0).abs());
+            // the snapshot (thermo table) shows the pressure that drives the barostat
+            let shown = trace3(m.snapshot().molecular_pressure_bar.unwrap());
+            worst = worst.max((shown / (two_k * bar) - 1.0).abs());
             atomic += trace3(m.snapshot().pressure_bar.unwrap());
             scaled += p;
             for (f, mass) in m.forces.forces.iter().zip(&masses) {

@@ -289,6 +289,12 @@ def run(args: argparse.Namespace) -> int:
     settings = NonbondedSettings.from_provider(plan.provider)
     system, electrostatics = build_system(top, settings)
     periodic = top.cell_nm is not None
+    if (plan.thermo or {}).get("pressure_molecular") and not (periodic and args.pressure_every):
+        # spec 0.1.3: refused rather than a column of NaN
+        raise ConfigError(
+            "E_UNSUPPORTED  [output.thermo] pressure_molecular: needs a periodic system and "
+            "--pressure-every > 0"
+        )
     temperature = plan.temperature_K
     if plan.remove_com_every > 0:
         system.addForce(mm.CMMotionRemover(plan.remove_com_every))
@@ -413,7 +419,10 @@ def run(args: argparse.Namespace) -> int:
     }
     thermo = traj = None
     if plan.thermo:
-        thermo = ThermoWriter(plan.out_dir / plan.thermo["file"], restart_step)
+        thermo = ThermoWriter(
+            plan.out_dir / plan.thermo["file"], restart_step,
+            bool(plan.thermo.get("pressure_molecular")),
+        )  # fmt: skip
     if plan.trajectory:
         tpath = plan.out_dir / plan.trajectory["file"]
         if tpath.suffix == ".xyz":
@@ -487,6 +496,9 @@ def run(args: argparse.Namespace) -> int:
             "total_kjmol": k + u, "conserved_energy_kjmol": conserved,
             "temperature_K": 2.0 * k / (dof * BOLTZMANN_KJMOL_K), "pressure_bar": pressure,
             "volume_nm3": volume,
+            # spec 0.1.3, written only when asked for: OpenMM's pressure is the molecular one, so
+            # on this backend both columns show the same value
+            "pressure_molecular_bar": pressure,
         }  # fmt: skip
         if not all(math.isfinite(x) for x in (k, u)):
             raise ModelError(f"non-finite energy at step {s}")
