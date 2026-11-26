@@ -22,6 +22,53 @@ ATOMIC_NUMBER = {s: z for z, s in enumerate(_SYMBOLS.split())}
 
 
 @dataclass(frozen=True)
+class PairTable:
+    """LJ σ_ij (nm) and ε_ij (kJ/mol) per type pair, for packages with `pair_overrides`.
+
+    Spec 0.1.2, system-package.md §5.2: the override where one is given, else the combination
+    rule. `type_index[i]` is atom i's row; the tables are symmetric.
+    """
+
+    type_index: np.ndarray
+    sigma_nm: np.ndarray
+    epsilon_kjmol: np.ndarray
+
+
+def combine(rule: str, s1: float, e1: float, s2: float, e2: float) -> tuple[float, float]:
+    """σ_ij, ε_ij by the combination rule (spec §5.2)."""
+    sigma = math.sqrt(s1 * s2) if rule == "geometric" else 0.5 * (s1 + s2)
+    return sigma, math.sqrt(e1 * e2)
+
+
+def pair_table(ff: dict, atom_types: list[str]) -> PairTable | None:
+    """The type-pair table of a force-field block, or None without overrides."""
+    overrides = ff.get("pair_overrides", [])
+    if not overrides:
+        return None
+    names = sorted(ff["atom_types"])
+    row = {t: k for k, t in enumerate(names)}
+    n = len(names)
+    sigma, epsilon = np.zeros((n, n)), np.zeros((n, n))
+    for a, ta in enumerate(names):
+        for b, tb in enumerate(names):
+            la, lb = ff["atom_types"][ta], ff["atom_types"][tb]
+            sigma[a, b], epsilon[a, b] = combine(
+                ff["combination_rule"],
+                la["sigma_nm"],
+                la["epsilon_kjmol"],
+                lb["sigma_nm"],
+                lb["epsilon_kjmol"],
+            )
+    for k, o in enumerate(overrides):
+        if o["types"][0] not in row or o["types"][1] not in row:
+            raise ValueError(f"pair override {k} names an unknown atom type: {o['types']}")
+        a, b = (row[t] for t in o["types"])
+        sigma[a, b] = sigma[b, a] = o["sigma_nm"]
+        epsilon[a, b] = epsilon[b, a] = o["epsilon_kjmol"]
+    return PairTable(np.array([row[t] for t in atom_types]), sigma, epsilon)
+
+
+@dataclass(frozen=True)
 class Topology:
     name: str
     system_json: str
@@ -48,6 +95,7 @@ class Topology:
     pairs14: list
     constraints: list
     molecule_type: tuple[str, ...] = ()  # per molecule, in canonical order
+    pairs: PairTable | None = None  # only with pair overrides (spec 0.1.2)
 
     @property
     def n_atoms(self) -> int:
@@ -78,7 +126,7 @@ def _graph_distances(n: int, bonds: list[list[int]], limit: int = 3) -> dict[tup
 
 
 def load(path: Path | str) -> Topology:
-    """Read a parameterized spec v0.1 package with all its bonded terms."""
+    """Read a parameterized spec 0.1 package with all its bonded terms (0.1.2: pair overrides)."""
     path = Path(path)
     raw = (path / "system.json").read_bytes()
     doc = json.loads(raw)
@@ -87,7 +135,7 @@ def load(path: Path | str) -> Topology:
     ff = doc.get("forcefield")
     if ff is None:
         raise ValueError("the OpenMM backend needs a parameterized package")
-    masses, charges, sigma, epsilon, species, molecule = ([] for _ in range(6))
+    masses, charges, sigma, epsilon, species, molecule, types = ([] for _ in range(7))
     bonds, angles, periodic, rb, imp_p, imp_h, excluded, pairs14, constraints = (
         [] for _ in range(9)
     )
@@ -101,6 +149,7 @@ def load(path: Path | str) -> Topology:
         for _ in range(component["count"]):
             for atom in mtype["atoms"]:
                 lj = ff["atom_types"][atom["type"]]
+                types.append(atom["type"])
                 masses.append(atom["mass_amu"])
                 charges.append(atom.get("charge_e") or 0.0)
                 sigma.append(lj["sigma_nm"])
@@ -185,4 +234,5 @@ def load(path: Path | str) -> Topology:
         pairs14,
         constraints,
         tuple(molecule_type),
+        pair_table(ff, types),
     )

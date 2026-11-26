@@ -1,6 +1,7 @@
 //! E1.7 acceptance: the engine's Lennard-Jones on the `argon-864` fixture against the OpenMM
 //! oracle references (tools/oracle/reference/argon-864, ADR 0005). Criteria from PLAN.md:
-//! energy 1e-8 relative, max|ΔF|/rms(F) ≤ 1e-6, virial 1e-6 relative.
+//! energy 1e-8 relative, max|ΔF|/rms(F) ≤ 1e-6, virial 1e-6 relative. Spec 0.1.2 (ADR 0015,
+//! A2): the same criteria on `kob-andersen-500`, whose A–B pair is a pair override.
 #![allow(clippy::unwrap_used, clippy::expect_used)] // test code
 
 use std::path::PathBuf;
@@ -30,7 +31,17 @@ fn umbrella() -> Option<PathBuf> {
 #[test]
 fn lennard_jones_matches_the_openmm_references() {
     let Some(root) = umbrella() else { return };
-    let package = read_package(&root.join("spec/fixtures/valid/argon-864")).unwrap();
+    check(&root, "argon-864", 864);
+}
+
+#[test]
+fn pair_overrides_match_the_openmm_references() {
+    let Some(root) = umbrella() else { return };
+    check(&root, "kob-andersen-500", 500);
+}
+
+fn check(root: &std::path::Path, name: &str, n: usize) {
+    let package = read_package(&root.join(format!("spec/fixtures/valid/{name}"))).unwrap();
     let state = &package.state;
     for (mode, stem) in [
         (CutoffMode::Truncate, "lj-truncate-rc0.85"),
@@ -38,16 +49,14 @@ fn lennard_jones_matches_the_openmm_references() {
     ] {
         let reference: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(
-                root.join(format!("tools/oracle/reference/argon-864/{stem}.json")),
+                root.join(format!("tools/oracle/reference/{name}/{stem}.json")),
             )
             .unwrap(),
         )
         .unwrap();
         let ref_forces = read_vec3_array(
-            &root.join(format!(
-                "tools/oracle/reference/argon-864/{stem}-forces.npy"
-            )),
-            864,
+            &root.join(format!("tools/oracle/reference/{name}/{stem}-forces.npy")),
+            n,
         )
         .unwrap();
         let mut lj = LennardJones::new(LennardJonesConfig {
@@ -59,7 +68,7 @@ fn lennard_jones_matches_the_openmm_references() {
         });
         lj.initialize(&package.system).unwrap();
         let mut out = ForceResult::default();
-        out.reset(864);
+        out.reset(n);
         lj.evaluate(
             &state.positions,
             state.cell.as_ref(),
@@ -70,7 +79,7 @@ fn lennard_jones_matches_the_openmm_references() {
 
         let e_ref = reference["energy_kjmol"].as_f64().unwrap();
         let e_rel = (out.energy.unwrap() - e_ref).abs() / e_ref.abs();
-        let rms = (ref_forces.iter().map(|f| f.length_squared()).sum::<f64>() / 864.0).sqrt();
+        let rms = (ref_forces.iter().map(|f| f.length_squared()).sum::<f64>() / n as f64).sqrt();
         let f_rel = out
             .forces
             .iter()
@@ -90,7 +99,7 @@ fn lennard_jones_matches_the_openmm_references() {
             }
         }
         w_rel /= w_scale;
-        eprintln!("{stem}: energy {e_rel:.2e}, forces {f_rel:.2e}, virial {w_rel:.2e}");
+        eprintln!("{name} {stem}: energy {e_rel:.2e}, forces {f_rel:.2e}, virial {w_rel:.2e}");
         assert!(
             e_rel <= 1e-8 && f_rel <= 1e-6 && w_rel <= 1e-6,
             "{stem}: {e_rel} {f_rel} {w_rel}"
@@ -107,7 +116,7 @@ fn lennard_jones_matches_the_openmm_references() {
         });
         lj.initialize(&package.system).unwrap();
         let mut with_tail = ForceResult::default();
-        with_tail.reset(864);
+        with_tail.reset(n);
         lj.evaluate(
             &state.positions,
             state.cell.as_ref(),

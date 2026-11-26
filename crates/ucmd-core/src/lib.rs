@@ -18,7 +18,7 @@ pub use cell::{Cell, CellError};
 pub use state::State;
 pub use system::{
     Angle, AngleForm, AtomTemplate, AtomType, Bond, BondForm, CombinationRule, Constraint,
-    ForceField, Instance, MoleculeType, System, SystemError, Torsion, TorsionForm,
+    ForceField, Instance, MoleculeType, PairOverride, System, SystemError, Torsion, TorsionForm,
 };
 
 /// Three-vector of f64 (positions in nm, velocities in nm/ps, forces in kJ mol⁻¹ nm⁻¹, …).

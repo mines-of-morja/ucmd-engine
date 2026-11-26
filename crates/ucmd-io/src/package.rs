@@ -17,7 +17,7 @@ use std::path::Path;
 use ucmd_core::units::RAD_PER_DEG;
 use ucmd_core::{
     Angle, AngleForm, AtomTemplate, AtomType, Bond, BondForm, Cell, CellError, CombinationRule,
-    Constraint, ForceField, MoleculeType, State, System, Torsion, TorsionForm, Vec3,
+    Constraint, ForceField, MoleculeType, PairOverride, State, System, Torsion, TorsionForm, Vec3,
 };
 
 /// |Σ q| allowed for periodic systems, in e (spec §7, E_NET_CHARGE).
@@ -142,6 +142,19 @@ struct ForceFieldDoc {
     scale_14_lj: f64,
     scale_14_coulomb: f64,
     atom_types: BTreeMap<String, AtomTypeDoc>,
+    #[serde(default)]
+    pair_overrides: Vec<PairOverrideDoc>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PairOverrideDoc {
+    types: [String; 2],
+    sigma_nm: f64,
+    epsilon_kjmol: f64,
+    #[serde(default)]
+    #[allow(dead_code)]
+    description: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -314,6 +327,30 @@ pub fn read_package(dir: &Path) -> Result<Package, SpecError> {
                         format!("/molecule_types/{name}/atoms/{k}"),
                     ));
                 }
+            }
+        }
+        for (k, o) in ff.pair_overrides.iter().enumerate() {
+            if let Some(t) = o.types.iter().find(|t| !ff.atom_types.contains_key(*t)) {
+                return Err(SpecError::new(
+                    ErrorCode::Reference,
+                    format!("pair override {k} names unknown atom type {t:?}"),
+                    format!("/forcefield/pair_overrides/{k}"),
+                ));
+            }
+        }
+        // E_PAIR_OVERRIDE (spec 0.1.2)
+        for (k, o) in ff.pair_overrides.iter().enumerate() {
+            let [a, b] = &o.types;
+            if let Some(first) = ff.pair_overrides[..k].iter().position(|p| {
+                (&p.types[0] == a && &p.types[1] == b) || (&p.types[0] == b && &p.types[1] == a)
+            }) {
+                return Err(SpecError::new(
+                    ErrorCode::PairOverride,
+                    format!(
+                        "pair override {k} repeats the pair [{a:?}, {b:?}] of override {first}"
+                    ),
+                    format!("/forcefield/pair_overrides/{k}"),
+                ));
             }
         }
     }
@@ -553,10 +590,15 @@ fn check_schema_ranges(doc: &SystemDoc) -> Result<(), SpecError> {
             && ff
                 .atom_types
                 .iter()
-                .all(|(n, t)| type_name_ok(n) && t.sigma_nm >= 0.0 && t.epsilon_kjmol >= 0.0);
+                .all(|(n, t)| type_name_ok(n) && t.sigma_nm >= 0.0 && t.epsilon_kjmol >= 0.0)
+            && ff.pair_overrides.iter().all(|o| {
+                o.types.iter().all(|t| type_name_ok(t))
+                    && o.sigma_nm >= 0.0
+                    && o.epsilon_kjmol >= 0.0
+            });
         if !ok {
             return Err(schema(
-                "forcefield: name, combination_rule, scale factors in [0, 1] or atom types invalid",
+                "forcefield: name, combination_rule, scale factors in [0, 1], atom types or pair overrides invalid",
                 "/forcefield",
             ));
         }
@@ -768,6 +810,27 @@ fn build_system(doc: &SystemDoc) -> Result<System, SpecError> {
         .enumerate()
         .map(|(i, n)| (n.as_str(), i))
         .collect();
+    let index_of = |k: usize, t: &str| {
+        type_index.get(t).copied().ok_or_else(|| {
+            SpecError::new(
+                ErrorCode::Reference,
+                format!("pair override {k} names unknown atom type {t:?}"),
+                format!("/forcefield/pair_overrides/{k}"),
+            )
+        })
+    };
+    let pair_overrides = doc
+        .forcefield
+        .iter()
+        .flat_map(|ff| ff.pair_overrides.iter().enumerate())
+        .map(|(k, o)| {
+            Ok(PairOverride {
+                types: [index_of(k, &o.types[0])?, index_of(k, &o.types[1])?],
+                sigma_nm: o.sigma_nm,
+                epsilon_kjmol: o.epsilon_kjmol,
+            })
+        })
+        .collect::<Result<Vec<_>, SpecError>>()?;
     let forcefield = doc.forcefield.as_ref().map(|ff| ForceField {
         name: ff.name.clone(),
         combination_rule: if ff.combination_rule == "geometric" {
@@ -786,6 +849,7 @@ fn build_system(doc: &SystemDoc) -> Result<System, SpecError> {
                 epsilon_kjmol: t.epsilon_kjmol,
             })
             .collect(),
+        pair_overrides: pair_overrides.clone(),
     });
     let names: Vec<&String> = doc.molecule_types.keys().collect();
     let mut molecule_types = Vec::with_capacity(names.len());

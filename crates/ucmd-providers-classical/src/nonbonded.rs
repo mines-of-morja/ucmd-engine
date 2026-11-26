@@ -398,9 +398,9 @@ impl ForceProvider for Nonbonded {
         self.charges = charges.to_vec();
         let rc = c.cutoff_nm.unwrap_or(f64::INFINITY);
         self.pairs.clear();
-        for a in &ff.atom_types {
-            for b in &ff.atom_types {
-                let (sigma, epsilon) = ff.combination_rule.combine(a, b);
+        for a in 0..self.n_types {
+            for b in 0..self.n_types {
+                let (sigma, epsilon) = ff.pair(a, b);
                 let shift = match (c.lj_cutoff_mode, c.cutoff_nm) {
                     (CutoffMode::PotentialShift, Some(rc)) => {
                         let s2 = sigma * sigma / (rc * rc);
@@ -903,6 +903,53 @@ mod tests {
         let mut p = Nonbonded::new("nonbonded", config);
         p.initialize(system).unwrap();
         p
+    }
+
+    /// Spec 0.1.2 (A5): a pair override applies to 1-4 pairs, scaled by `scale_14_lj`.
+    #[test]
+    fn pair_override_applies_to_1_4_pairs() {
+        use crate::test_util::{chain_molecule, test_forcefield};
+        use ucmd_core::{AtomType, PairOverride};
+        let mut chain = chain_molecule(4);
+        chain.atoms[3].atom_type = Some(1);
+        let mut ff = test_forcefield();
+        ff.atom_types.push(AtomType {
+            name: "D".into(),
+            ..ff.atom_types[0].clone()
+        });
+        // test numbers, not a force field
+        ff.pair_overrides.push(PairOverride {
+            types: [0, 1],
+            sigma_nm: 0.3,
+            epsilon_kjmol: 0.5,
+        });
+        let system = System::new("chain", vec![chain], &[(0, 1)], Some(ff), [false; 3]).unwrap();
+        let x = vec![
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.15, 0.0, 0.0),
+            Vec3::new(0.2, 0.14, 0.0),
+            Vec3::new(0.35, 0.16, 0.05),
+        ];
+        let mut p = provider(&system, NonbondedConfig::default());
+        let mut out = ForceResult::default();
+        out.reset(4);
+        p.evaluate(&x, None, &EvalRequest::everything(), &mut out)
+            .unwrap();
+        let lj14 = out
+            .energy_terms
+            .iter()
+            .find(|(n, _)| *n == "lj14")
+            .unwrap()
+            .1;
+        let r = (x[3] - x[0]).length();
+        let s6 = (0.3 / r).powi(6);
+        let expected = 0.5 * 4.0 * 0.5 * (s6 * s6 - s6); // scale_14_lj = 0.5
+        assert!(
+            (lj14 - expected).abs() <= 1e-12 * expected.abs(),
+            "{lj14} vs {expected}"
+        );
+        let f = fd_force_check(&mut p, &x, None, &FdOptions::default()).unwrap();
+        assert!(f.max_rel_error < 1e-6, "{f:?}");
     }
 
     #[test]

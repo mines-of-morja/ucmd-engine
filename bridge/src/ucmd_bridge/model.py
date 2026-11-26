@@ -93,6 +93,10 @@ def pme_parameters(cell_nm, s: NonbondedSettings) -> tuple[float, int, int, int]
 
 
 def _mix(top: Topology, i: int, j: int) -> tuple[float, float]:
+    """σ_ij, ε_ij of atoms i, j: the pair override if there is one, else the rule."""
+    if top.pairs is not None:
+        a, b = top.pairs.type_index[i], top.pairs.type_index[j]
+        return float(top.pairs.sigma_nm[a, b]), float(top.pairs.epsilon_kjmol[a, b])
     si, sj = top.sigma_nm[i], top.sigma_nm[j]
     sigma = math.sqrt(si * sj) if top.combination_rule == "geometric" else 0.5 * (si + sj)
     return sigma, math.sqrt(top.epsilon_kjmol[i] * top.epsilon_kjmol[j])
@@ -110,8 +114,13 @@ def tail_weights(top: Topology) -> tuple[list[int], list[float], float]:
     molecules, 6·10⁻⁶ of the conformance energy). Weights w_aa = n_a (N+1) / (N (n_a+1)) and
     w_ab = (N+1)/N on the integrand of the class pair turn OpenMM's sum into the engine's.
     Classes are distinct (σ, ε); the engine's formula does not change when types with equal
-    parameters are merged."""
-    keys = list(zip(top.sigma_nm.tolist(), top.epsilon_kjmol.tolist(), strict=True))
+    parameters are merged. With pair overrides (spec 0.1.2) the classes are the atom types: a
+    type's pairs may differ from another's with the same σ and ε, and OpenMM groups the particles
+    by their per-particle parameters, which are then the types."""
+    if top.pairs is not None:
+        keys = [(int(t), 0.0) for t in top.pairs.type_index]
+    else:
+        keys = list(zip(top.sigma_nm.tolist(), top.epsilon_kjmol.tolist(), strict=True))
     index: dict[tuple[float, float], int] = {}
     cls = [index.setdefault(k, len(index)) for k in keys]
     counts = [0] * len(index)
@@ -120,6 +129,51 @@ def tail_weights(top: Topology) -> tuple[list[int], list[float], float]:
     n = len(cls)
     diagonal = [counts[c] * (n + 1) / (n * (counts[c] + 1)) for c in cls]
     return cls, diagonal, (n + 1) / n
+
+
+def _lj_force(top: Topology, shift: str, tail: bool) -> mm.CustomNonbondedForce:
+    """LJ between non-excluded pairs: per-particle mixing, or per-type tables with overrides.
+
+    Without overrides the expression is the one used before spec 0.1.2, so existing runs do not
+    change. With them, σ_ij and ε_ij come from Discrete2DFunction tables (OpenMM's usual NBFIX
+    route), which keeps the cutoff, the shift and the long-range correction. With the tail
+    correction, OpenMM's integral beyond the cutoff carries the class-pair weights of
+    `tail_weights`; inside the cutoff the factor is exactly 1.
+    """
+    energy = f"4*eps*((sig/r)^12-(sig/r)^6){shift}"
+    if tail:
+        energy = f"({energy})*(1 + step(r - rc)*(w - 1)); w = select(delta(cls1 - cls2), wd1, wo)"
+    if top.pairs is None:
+        mix = (
+            "sig=sqrt(sig1*sig2); eps=sqrt(eps1*eps2)"
+            if top.combination_rule == "geometric"
+            else "sig=0.5*(sig1+sig2); eps=sqrt(eps1*eps2)"
+        )
+        lj = mm.CustomNonbondedForce(f"{energy}; {mix}")
+        lj.addPerParticleParameter("sig")
+        lj.addPerParticleParameter("eps")
+        values = [
+            [float(sg), float(ep)] for sg, ep in zip(top.sigma_nm, top.epsilon_kjmol, strict=True)
+        ]
+    else:
+        n = len(top.pairs.sigma_nm)
+        lj = mm.CustomNonbondedForce(f"{energy}; sig=sigt(t1, t2); eps=epst(t1, t2)")
+        # Discrete2DFunction values run with the first index fastest; the tables are symmetric.
+        sig = top.pairs.sigma_nm.T.ravel().tolist()
+        eps = top.pairs.epsilon_kjmol.T.ravel().tolist()
+        lj.addTabulatedFunction("sigt", mm.Discrete2DFunction(n, n, sig))
+        lj.addTabulatedFunction("epst", mm.Discrete2DFunction(n, n, eps))
+        lj.addPerParticleParameter("t")
+        values = [[float(t)] for t in top.pairs.type_index]
+    if tail:
+        lj.addPerParticleParameter("cls")
+        lj.addPerParticleParameter("wd")
+        cls, diagonal, off_diagonal = tail_weights(top)
+        lj.addGlobalParameter("wo", off_diagonal)
+        values = [[*v, float(c), wd] for v, c, wd in zip(values, cls, diagonal, strict=True)]
+    for v in values:
+        lj.addParticle(v)
+    return lj
 
 
 def build_system(top: Topology, s: NonbondedSettings) -> tuple[mm.System, dict]:
@@ -168,32 +222,10 @@ def build_system(top: Topology, s: NonbondedSettings) -> tuple[mm.System, dict]:
     for i, j in top.pairs14:
         qq = top.scale_14_coulomb * top.charges_e[i] * top.charges_e[j]
         coulomb.addException(i, j, float(qq), 1.0, 0.0)
-    mix = (
-        "sig=sqrt(sig1*sig2); eps=sqrt(eps1*eps2)"
-        if top.combination_rule == "geometric"
-        else "sig=0.5*(sig1+sig2); eps=sqrt(eps1*eps2)"
-    )
     shift = " - 4*eps*((sig/rc)^12-(sig/rc)^6)" if s.lj_cutoff_mode == "potential-shift" else ""
-    energy = f"4*eps*((sig/r)^12-(sig/r)^6){shift}"
-    if s.dispersion_correction:
-        if not periodic:
-            raise ModelError("the tail correction needs a periodic package")
-        # inside the cutoff the factor is exactly 1; only OpenMM's integral of the tail beyond
-        # it sees the class-pair weights (tail_weights)
-        energy = f"({energy})*(1 + step(r - rc)*(w - 1)); w = select(delta(cls1 - cls2), wd1, wo)"
-    lj = mm.CustomNonbondedForce(f"{energy}; {mix}")
-    lj.addPerParticleParameter("sig")
-    lj.addPerParticleParameter("eps")
-    if s.dispersion_correction:
-        lj.addPerParticleParameter("cls")
-        lj.addPerParticleParameter("wd")
-        cls, diagonal, off_diagonal = tail_weights(top)
-        lj.addGlobalParameter("wo", off_diagonal)
-        for sg, ep, c, wd in zip(top.sigma_nm, top.epsilon_kjmol, cls, diagonal, strict=True):
-            lj.addParticle([float(sg), float(ep), float(c), wd])
-    else:
-        for sg, ep in zip(top.sigma_nm, top.epsilon_kjmol, strict=True):
-            lj.addParticle([float(sg), float(ep)])
+    if s.dispersion_correction and not periodic:
+        raise ModelError("the tail correction needs a periodic package")
+    lj = _lj_force(top, shift, s.dispersion_correction)
     for i, j in (*top.excluded, *top.pairs14):
         lj.addExclusion(i, j)
     lj.setUseLongRangeCorrection(s.dispersion_correction)

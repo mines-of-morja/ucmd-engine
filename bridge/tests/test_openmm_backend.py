@@ -579,3 +579,81 @@ def test_constraints_with_langevin_run_on_openmm(tmp_path: Path) -> None:
     i, j, d = pairs[:, 0].astype(int), pairs[:, 1].astype(int), pairs[:, 2]
     r_ij = np.linalg.norm(x[:, i] - x[:, j], axis=-1)
     assert (np.abs(r_ij - d) / d).max() < 1e-7  # single-precision lengths in OpenMM, see above
+
+
+def test_pair_overrides_agree_with_the_engine(tmp_path: Path) -> None:
+    """Spec 0.1.2 (ADR 0015, A7): kob-andersen-500, whose A-B pair is an override, runs through
+    the OpenMM backend; the conformance single point agrees with the CPU engine.
+
+    Without the tail correction: OpenMM's CustomNonbondedForce counts pairs within a type class
+    as n(n+1)/2 and rescales, an O(1/N) difference from the engine's N_a N_b for several types
+    (tools/oracle/test_oracle.py::test_type_pair_dispersion_correction).
+    """
+    text = (
+        ARGON.format(steps=20, thermostat="nose-hoover-chain")
+        .replace("dispersion_correction = true", 'lj_cutoff_mode = "potential-shift"')
+        .replace("timestep_fs = 4.0", "timestep_fs = 2.0")
+    )
+    profile = setup_run(tmp_path, "kob-andersen-500", text)
+    r = ucmd(tmp_path, profile)
+    assert r.returncode == 0, r.stderr
+    line = next(x for x in r.stderr.splitlines() if "conformance with" in x)
+    assert float(line.split("energy ")[1].split(",")[0]) < 1e-9, line
+    assert float(line.split("forces ")[1].split(" ")[0]) < 1e-9, line
+
+
+def test_pair_overrides_with_the_tail_correction_agree_with_the_engine(tmp_path: Path) -> None:
+    """Both at once (merge of the tail weights and the pair overrides, 2026-11-27): the classes
+    of the tail weights are the atom types, and the conformance single point with the tail
+    correction agrees with the CPU engine as without it."""
+    text = ARGON.format(steps=20, thermostat="nose-hoover-chain").replace(
+        "timestep_fs = 4.0", "timestep_fs = 2.0"
+    )
+    assert "dispersion_correction = true" in text
+    profile = setup_run(tmp_path, "kob-andersen-500", text)
+    r = ucmd(tmp_path, profile)
+    assert r.returncode == 0, r.stderr
+    line = next(x for x in r.stderr.splitlines() if "conformance with" in x)
+    assert float(line.split("energy ")[1].split(",")[0]) < 1e-9, line
+    assert float(line.split("forces ")[1].split(" ")[0]) < 1e-9, line
+
+
+def test_rule_equal_overrides_build_the_same_forces() -> None:
+    """A1 for the bridge: a table filled by the combination rule gives the per-particle result."""
+    import dataclasses
+
+    import openmm as mm
+
+    from ucmd_bridge import model, package
+
+    top = package.load(SPEC / "fixtures/valid/kob-andersen-500")
+    assert top.pairs is not None
+    names = ["A"] * 400 + ["B"] * 100
+    sa, ea, sb, eb = top.sigma_nm[0], top.epsilon_kjmol[0], top.sigma_nm[-1], top.epsilon_kjmol[-1]
+    ff = {
+        "combination_rule": top.combination_rule,
+        "atom_types": {
+            "A": {"sigma_nm": sa, "epsilon_kjmol": ea},
+            "B": {"sigma_nm": sb, "epsilon_kjmol": eb},
+        },
+        "pair_overrides": [
+            {"types": ["A", "B"], "sigma_nm": 0.5 * (sa + sb), "epsilon_kjmol": (ea * eb) ** 0.5}
+        ],
+    }
+    settings = model.NonbondedSettings.from_provider({"kind": "force-field", "cutoff_nm": 0.85})
+
+    def evaluate(t: package.Topology) -> tuple[float, np.ndarray]:
+        system, _ = model.build_system(t, settings)
+        ctx = mm.Context(
+            system, mm.VerletIntegrator(0.001), mm.Platform.getPlatformByName("Reference")
+        )
+        ctx.setPositions(t.positions_nm)
+        st = ctx.getState(getEnergy=True, getForces=True)
+        return st.getPotentialEnergy()._value, st.getForces(asNumpy=True)._value
+
+    e_rule, f_rule = evaluate(dataclasses.replace(top, pairs=None))
+    e_tab, f_tab = evaluate(dataclasses.replace(top, pairs=package.pair_table(ff, names)))
+    e_ka, _ = evaluate(top)
+    assert e_tab == pytest.approx(e_rule, rel=1e-12)
+    assert np.abs(f_tab - f_rule).max() <= 1e-12 * np.abs(f_rule).max()
+    assert abs(e_ka - e_rule) > 1.0  # the real override changes the energy

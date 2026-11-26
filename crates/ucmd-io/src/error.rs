@@ -17,6 +17,8 @@ pub enum ErrorCode {
     Schema,
     /// Unknown molecule type or atom type.
     Reference,
+    /// A pair override repeats a pair (spec 0.1.2).
+    PairOverride,
     /// Interaction index out of range or repeated.
     Index,
     /// `atom_count` does not match the components.
@@ -53,6 +55,7 @@ impl ErrorCode {
             Self::Units => "E_UNITS",
             Self::Schema => "E_SCHEMA",
             Self::Reference => "E_REFERENCE",
+            Self::PairOverride => "E_PAIR_OVERRIDE",
             Self::Index => "E_INDEX",
             Self::AtomCount => "E_ATOM_COUNT",
             Self::Cell => "E_CELL",

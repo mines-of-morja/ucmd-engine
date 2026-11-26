@@ -47,6 +47,60 @@ pub struct ForceField {
     pub scale_14_coulomb: f64,
     /// Atom types, referenced by index from [`AtomTemplate::atom_type`].
     pub atom_types: Vec<AtomType>,
+    /// Lennard-Jones parameters for single type pairs that replace the combination rule
+    /// (spec 0.1.2, system-package.md §5.2). Each unordered pair appears at most once.
+    pub pair_overrides: Vec<PairOverride>,
+}
+
+/// Lennard-Jones parameters of one pair of atom types, instead of the combination rule.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PairOverride {
+    /// The two atom types, as indices into [`ForceField::atom_types`]; unordered.
+    pub types: [usize; 2],
+    /// σ_ij in nm.
+    pub sigma_nm: f64,
+    /// ε_ij in kJ/mol.
+    pub epsilon_kjmol: f64,
+}
+
+fn check_pair_overrides(ff: &ForceField) -> Result<(), SystemError> {
+    for (index, o) in ff.pair_overrides.iter().enumerate() {
+        let bad = |what: String| SystemError::BadPairOverride { index, what };
+        if o.types.iter().any(|&t| t >= ff.atom_types.len()) {
+            return Err(bad(format!(
+                "atom types {:?}, but there are {}",
+                o.types,
+                ff.atom_types.len()
+            )));
+        }
+        let [a, b] = o.types;
+        if ff.pair_overrides[..index]
+            .iter()
+            .any(|p| p.types == [a, b] || p.types == [b, a])
+        {
+            return Err(bad(format!("repeats the pair {:?}", o.types)));
+        }
+    }
+    Ok(())
+}
+
+impl ForceField {
+    /// Pair parameters (σ_ij in nm, ε_ij in kJ/mol) of atom types `a` and `b`: the override if
+    /// there is one, else the combination rule. This applies to every LJ pair, 1-4 pairs
+    /// included (before `scale_14_lj`).
+    ///
+    /// # Panics
+    /// If `a` or `b` is not an index into `atom_types`.
+    pub fn pair(&self, a: usize, b: usize) -> (f64, f64) {
+        self.pair_overrides
+            .iter()
+            .find(|o| o.types == [a, b] || o.types == [b, a])
+            .map(|o| (o.sigma_nm, o.epsilon_kjmol))
+            .unwrap_or_else(|| {
+                self.combination_rule
+                    .combine(&self.atom_types[a], &self.atom_types[b])
+            })
+    }
 }
 
 /// One atom of a molecule type.
@@ -222,6 +276,14 @@ pub enum SystemError {
     /// The system has no atoms.
     #[error("the system has no atoms")]
     Empty,
+    /// A pair override names a missing atom type, or repeats a pair (spec 0.1.2).
+    #[error("pair override {index}: {what}")]
+    BadPairOverride {
+        /// Index into [`ForceField::pair_overrides`].
+        index: usize,
+        /// Description.
+        what: String,
+    },
 }
 
 /// The immutable system of a run.
@@ -256,6 +318,9 @@ impl System {
         forcefield: Option<ForceField>,
         periodicity: [bool; 3],
     ) -> Result<Self, SystemError> {
+        if let Some(ff) = &forcefield {
+            check_pair_overrides(ff)?;
+        }
         for mtype in &molecule_types {
             check_indices(mtype)?;
             if let Some(ff) = &forcefield {
@@ -507,5 +572,39 @@ mod tests {
         assert!((s - 0.12f64.sqrt()).abs() < 1e-15 && (e - 1.0).abs() < 1e-15);
         let (s, _) = CombinationRule::LorentzBerthelot.combine(&a, &b);
         assert!((s - 0.35).abs() < 1e-15);
+    }
+
+    #[test]
+    fn pair_overrides_replace_the_rule_for_their_pair_only() {
+        let t = |name: &str, sigma_nm, epsilon_kjmol| AtomType {
+            name: name.into(),
+            sigma_nm,
+            epsilon_kjmol,
+        };
+        let mut ff = ForceField {
+            name: "t".into(),
+            combination_rule: CombinationRule::LorentzBerthelot,
+            scale_14_lj: 0.5,
+            scale_14_coulomb: 0.5,
+            atom_types: vec![t("a", 0.3, 0.5), t("b", 0.4, 2.0), t("c", 0.2, 1.0)],
+            pair_overrides: vec![],
+        };
+        let rule = ff.pair(0, 1);
+        assert_eq!(rule, (0.35, 1.0));
+        ff.pair_overrides.push(PairOverride {
+            types: [1, 0],
+            sigma_nm: 0.25,
+            epsilon_kjmol: 3.0,
+        });
+        assert_eq!(ff.pair(0, 1), (0.25, 3.0));
+        assert_eq!(ff.pair(1, 0), (0.25, 3.0));
+        assert_eq!(
+            ff.pair(0, 2),
+            CombinationRule::LorentzBerthelot.combine(&ff.atom_types[0], &ff.atom_types[2])
+        );
+        assert_eq!(
+            ff.pair(1, 1),
+            CombinationRule::LorentzBerthelot.combine(&ff.atom_types[1], &ff.atom_types[1])
+        );
     }
 }

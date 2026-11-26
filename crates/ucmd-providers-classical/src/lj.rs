@@ -1,8 +1,8 @@
 //! Lennard-Jones 12-6 (PLAN.md E1.7): E = 4ε_ij[(σ_ij/r)¹² − (σ_ij/r)⁶] within a cutoff.
 //!
-//! Pair parameters come from the atom types via the force field's combination rule. Exclusions
-//! arrive with bonded terms in E2.2; until then systems with bonds are rejected rather than
-//! computed wrongly.
+//! Pair parameters come from the atom types via the force field's combination rule, or from a
+//! pair override (spec 0.1.2, `ForceField::pair`). Exclusions arrive with bonded terms in E2.2;
+//! until then systems with bonds are rejected rather than computed wrongly.
 
 use crate::neighbor::NeighborList;
 use serde::Deserialize;
@@ -114,9 +114,9 @@ impl ForceProvider for LennardJones {
         self.n_types = ff.atom_types.len();
         self.type_of = types.to_vec();
         self.pairs.clear();
-        for a in &ff.atom_types {
-            for b in &ff.atom_types {
-                let (sigma, epsilon) = ff.combination_rule.combine(a, b);
+        for a in 0..self.n_types {
+            for b in 0..self.n_types {
+                let (sigma, epsilon) = ff.pair(a, b);
                 let shift = match self.config.cutoff_mode {
                     CutoffMode::PotentialShift => lj_energy(sigma, epsilon, rc * rc),
                     CutoffMode::Truncate => 0.0,
@@ -298,6 +298,7 @@ mod tests {
                     epsilon_kjmol: 0.6,
                 },
             ],
+            pair_overrides: vec![],
         };
         let n = n_per_edge.pow(3);
         let mut components = vec![(0, n / 2), (1, n - n / 2)];
@@ -370,6 +371,98 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Spec 0.1.2 (ADR 0015): an A–B pair override passes the testkit, changes the energy, and
+    /// an override equal to the combination rule changes nothing, bitwise (A1, A3).
+    #[test]
+    fn pair_overrides_pass_the_testkit_and_reduce_to_the_rule() {
+        let cell = triclinic(2.8);
+        let (plain, x) = fluid(6, &cell, 11, false);
+        let with_override = |sigma_nm: f64, epsilon_kjmol: f64| {
+            let mut s = plain.clone();
+            if let Some(ff) = s.forcefield.as_mut() {
+                ff.pair_overrides.push(ucmd_core::PairOverride {
+                    types: [1, 0],
+                    sigma_nm,
+                    epsilon_kjmol,
+                });
+            }
+            s
+        };
+        let run = |system: &System, mode: CutoffMode| {
+            let mut lj = LennardJones::new(LennardJonesConfig {
+                dispersion_correction: true,
+                ..config(mode, true)
+            });
+            lj.initialize(system).unwrap();
+            evaluate_all(&mut lj, &x, Some(&cell)).unwrap()
+        };
+        // test numbers: an A–B pair deeper and shorter than Lorentz–Berthelot gives (0.32, 0.774)
+        let changed = with_override(0.29, 1.4);
+        for mode in [CutoffMode::Truncate, CutoffMode::PotentialShift] {
+            let mut lj = LennardJones::new(config(mode, true));
+            lj.initialize(&changed).unwrap();
+            let options = FdOptions {
+                atoms: Some(vec![0, 17, 101, 200]),
+                ..FdOptions::default()
+            };
+            let fd = fd_force_check(&mut lj, &x, Some(&cell), &options).unwrap();
+            assert!(fd.max_rel_error < 1e-5, "{mode:?}: {fd:?}");
+            assert!(momentum_check(&mut lj, &x, Some(&cell)).unwrap() < 1e-13);
+            if mode == CutoffMode::PotentialShift {
+                let w = fd_virial_check(&mut lj, &x, Some(&cell), 1e-6).unwrap();
+                assert!(w.max_rel_error < 1e-5 && w.asymmetry < 1e-12, "{w:?}");
+            }
+            let base = run(&plain, mode);
+            assert!((run(&changed, mode).energy.unwrap() - base.energy.unwrap()).abs() > 1.0);
+            let (s, e) = plain.forcefield.as_ref().unwrap().pair(0, 1);
+            let same = run(&with_override(s, e), mode);
+            assert_eq!(same.energy, base.energy, "{mode:?}");
+            assert_eq!(same.forces, base.forces, "{mode:?}");
+            assert_eq!(same.virial, base.virial, "{mode:?}");
+        }
+    }
+
+    /// A4: with an override the tail is (8π/3V) Σ_ab N_a N_b ε_ab σ_ab³ (x_ab⁹/3 − x_ab³).
+    #[test]
+    fn tail_correction_uses_the_pair_override() {
+        let cell = cubic(3.0);
+        let (mut system, x) = fluid(5, &cell, 9, false);
+        let ff = system.forcefield.as_mut().unwrap();
+        ff.pair_overrides.push(ucmd_core::PairOverride {
+            types: [0, 1],
+            sigma_nm: 0.29,
+            epsilon_kjmol: 1.4,
+        });
+        let ff = system.forcefield.clone().unwrap();
+        let with = |correction: bool| {
+            let mut lj = LennardJones::new(LennardJonesConfig {
+                dispersion_correction: correction,
+                ..config(CutoffMode::Truncate, true)
+            });
+            lj.initialize(&system).unwrap();
+            evaluate_all(&mut lj, &x, Some(&cell)).unwrap()
+        };
+        let got = with(true).energy.unwrap() - with(false).energy.unwrap();
+        let counts = [62.0, 63.0]; // fluid(): n/2 of type A, the rest B
+        let mut expected = 0.0;
+        for a in 0..2 {
+            for b in 0..2 {
+                let (sigma, epsilon) = ff.pair(a, b);
+                let xr: f64 = sigma / 0.9;
+                expected += counts[a]
+                    * counts[b]
+                    * epsilon
+                    * sigma.powi(3)
+                    * (xr.powi(9) / 3.0 - xr.powi(3));
+            }
+        }
+        expected *= 8.0 / 3.0 * PI / 27.0;
+        assert!(
+            (got - expected).abs() <= 1e-12 * expected.abs(),
+            "{got} vs {expected}"
+        );
     }
 
     /// E1.8: the neighbour list gives the same forces and energy as all pairs.

@@ -159,6 +159,7 @@ pub fn test_forcefield() -> ForceField {
             sigma_nm: 0.35,
             epsilon_kjmol: 0.276,
         }],
+        pair_overrides: vec![],
     }
 }
 
