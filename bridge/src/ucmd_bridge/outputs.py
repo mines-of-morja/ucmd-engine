@@ -11,6 +11,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .model import ModelError
+
 THERMO_COLUMNS = (
     "step",
     "time_ps",
@@ -83,7 +85,9 @@ class XyzWriter:
         else:
             self.fh = path.open("w")
 
-    def write(self, step: int, time_ps: float, positions_nm: np.ndarray, cell_nm) -> None:
+    def write(self, step: int, time_ps: float, positions_nm: np.ndarray, cell_nm,
+              row: dict | None = None) -> None:  # fmt: skip
+        """One frame; the thermo `row` of the H5MD writer has no place in this format."""
         out = [f"{len(positions_nm)}\n"]
         comment = "Properties=species:S:1:pos:R:3"
         if cell_nm is not None:
@@ -110,13 +114,23 @@ class H5mdWriter:
         ("volume", "volume_nm3", "nm3"),
     )
 
+    VECTORS = (("velocity", "nm ps-1"), ("force", "kJ mol-1 nm-1"))  # optional, per atom
+
     def __init__(self, path: Path, top, *, precision: str, provenance: dict,
-                 restart_step: int | None) -> None:  # fmt: skip
+                 restart_step: int | None, vectors: tuple[str, ...] = ()) -> None:  # fmt: skip
+        """`vectors`: which of "velocity" and "force" every frame also holds."""
         import h5py
 
         self.dtype = np.float32 if precision == "float32" else np.float64
+        self.vectors = [name for name, _unit in self.VECTORS if name in vectors]
         if restart_step is not None and path.is_file():
             self.fh = h5py.File(path, "a")
+            missing = [n for n in self.vectors if n not in self.fh["particles/all"]]
+            if missing:
+                self.fh.close()
+                raise ModelError(
+                    f"{path}: the trajectory to continue holds no {' and no '.join(missing)} series"
+                )
             self._truncate(restart_step)
             return
         self.fh = fh = h5py.File(path, "w")
@@ -134,6 +148,9 @@ class H5mdWriter:
         box.attrs["boundary"] = ["periodic" if periodic else "none"] * 3
         self._series(box, "edges", (3, 3), "nm")
         self._series(part, "position", (top.n_atoms, 3), "nm")
+        for name, unit in self.VECTORS:
+            if name in self.vectors:
+                self._series(part, name, (top.n_atoms, 3), unit)
         for name, data, unit in (("mass", top.masses_amu, "amu"), ("charge", top.charges_e, "e")):
             d = part.create_dataset(name, data=np.asarray(data, dtype=np.float64))
             d.attrs["unit"] = unit
@@ -166,6 +183,8 @@ class H5mdWriter:
     def _groups(self):
         yield self.fh["particles/all/box/edges"]
         yield self.fh["particles/all/position"]
+        for name in self.vectors:
+            yield self.fh[f"particles/all/{name}"]
         for name, _key, _unit in self.OBSERVABLES:
             yield self.fh[f"observables/{name}"]
 
@@ -185,10 +204,14 @@ class H5mdWriter:
         g["time"][n] = time_ps
         g["value"][n] = value
 
-    def write(self, step: int, time_ps: float, positions_nm, cell_nm, row: dict) -> None:
+    def write(self, step: int, time_ps: float, positions_nm, cell_nm, row: dict,
+              vectors: dict | None = None) -> None:  # fmt: skip
+        """One frame. `vectors` holds the series named at creation, in canonical atom order."""
         edges = np.zeros((3, 3)) if cell_nm is None else np.asarray(cell_nm)
         self._append(self.fh["particles/all/box/edges"], step, time_ps, edges)
         self._append(self.fh["particles/all/position"], step, time_ps, positions_nm)
+        for name in self.vectors:
+            self._append(self.fh[f"particles/all/{name}"], step, time_ps, vectors[name])
         for name, key, _unit in self.OBSERVABLES:
             value = row.get(key)
             self._append(self.fh[f"observables/{name}"], step, time_ps,

@@ -167,6 +167,14 @@ def read_plan(run_toml: Path) -> Plan:
             "E_UNSUPPORTED  [output.thermo] pressure_tensor: OpenMM gives no pressure tensor; "
             "run on the CPU backend"
         )
+    trajectory = output.get("trajectory") or {}
+    if str(trajectory.get("file", "")).endswith(".xyz"):
+        for key in ("velocities", "forces"):
+            if trajectory.get(key):
+                raise ConfigError(
+                    f"E_UNSUPPORTED  [output.trajectory] {key}: an .xyz trajectory holds positions "
+                    "only; use a .h5 file"
+                )
     return Plan(
         run_toml=run_toml,
         raw=raw,
@@ -411,6 +419,16 @@ def run(args: argparse.Namespace) -> int:
             **{k: v for k, v in check.items() if isinstance(v, (int, float, str))},
         },
     }
+    # per-atom series of the trajectory besides the positions, and how a state returns them
+    vectors = {}
+    if plan.trajectory and plan.trajectory.get("velocities"):
+        vectors["velocity"] = lambda st: st.getVelocities(asNumpy=True).value_in_unit(
+            unit.nanometer / unit.picosecond
+        )
+    if plan.trajectory and plan.trajectory.get("forces"):
+        vectors["force"] = lambda st: st.getForces(asNumpy=True).value_in_unit(
+            unit.kilojoule_per_mole / unit.nanometer
+        )
     thermo = traj = None
     if plan.thermo:
         thermo = ThermoWriter(plan.out_dir / plan.thermo["file"], restart_step)
@@ -422,7 +440,7 @@ def run(args: argparse.Namespace) -> int:
         else:
             traj = H5mdWriter(
                 tpath, top, precision=plan.trajectory.get("precision", "float64"),
-                provenance=provenance, restart_step=restart_step,
+                provenance=provenance, restart_step=restart_step, vectors=tuple(vectors),
             )  # fmt: skip
             if restart_step is not None:
                 traj.record_restart({"step": restart_step, "forced": bool(args.force),
@@ -459,8 +477,10 @@ def run(args: argparse.Namespace) -> int:
         need_p = probe is not None and bool(pressure_every) and s % pressure_every == 0
         need_pos = need_traj or need_p or s % track_every_steps(plan.dt_ps, s * plan.dt_ps) == 0
         state = context.getState(
-            getEnergy=True, getPositions=need_pos, getVelocities=need_p, enforcePeriodicBox=False
-        )
+            getEnergy=True, getPositions=need_pos,
+            getVelocities=need_p or (need_traj and "velocity" in vectors),
+            getForces=need_traj and "force" in vectors, enforcePeriodicBox=False,
+        )  # fmt: skip
         k = state.getKineticEnergy().value_in_unit(unit.kilojoule_per_mole)
         u = state.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
         t_ps = state.getTime().value_in_unit(unit.picosecond)
@@ -496,7 +516,12 @@ def run(args: argparse.Namespace) -> int:
             raw = state.getPositions(asNumpy=True).value_in_unit(unit.nanometer)
             positions = tracker.update(np.asarray(raw))  # canonical order (invariant 4)
             if need_traj:
-                traj.write(s, t_ps, positions, cell, row)
+                if vectors:  # from the same state, so the same labels as the positions
+                    perm = tracker.perm
+                    frame = {name: np.asarray(read(state))[perm] for name, read in vectors.items()}
+                    traj.write(s, t_ps, positions, cell, row, frame)
+                else:
+                    traj.write(s, t_ps, positions, cell, row)
                 # for an emergency checkpoint: the state and its own step and labels
                 last_good[0] = (meta(), context.createCheckpoint())
         if ckpt_path and every["checkpoint"] and s % every["checkpoint"] == 0 and s > 0:
