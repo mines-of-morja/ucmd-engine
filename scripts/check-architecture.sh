@@ -16,6 +16,8 @@ declare -A ALLOWED=(
   [ucmd-io]="ucmd-core ucmd-force"
   [ucmd-providers-classical]="ucmd-core ucmd-force"
   [ucmd-providers-ipi]="ucmd-core ucmd-force"
+  # ucmd-ff is the external force-field library (own repository), not a workspace crate.
+  [ucmd-providers-ff]="ucmd-core ucmd-force ucmd-ff"
 )
 UNRESTRICTED="ucmd-cli"
 

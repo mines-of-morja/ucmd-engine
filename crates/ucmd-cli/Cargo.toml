@@ -14,6 +14,7 @@ ucmd-md.workspace = true
 ucmd-io.workspace = true
 ucmd-providers-classical.workspace = true
 ucmd-providers-ipi.workspace = true
+ucmd-providers-ff.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 serde.workspace = true
