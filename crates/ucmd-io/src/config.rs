@@ -127,6 +127,20 @@ pub struct FileOutput {
     pub every: u64,
 }
 
+/// `[output.thermo]`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThermoOutput {
+    /// File name relative to the output directory.
+    pub file: String,
+    /// Interval in steps.
+    pub every: u64,
+    /// Spec 0.1.1: also write the six components of the symmetrized pressure tensor in bar.
+    /// Not serialized when false, so the restart fingerprint of older runs stays the same.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pressure_tensor: bool,
+}
+
 /// `[output.trajectory]`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -158,7 +172,7 @@ pub struct OutputSection {
     pub trajectory: Option<TrajectoryOutput>,
     /// Thermo table output.
     #[serde(default)]
-    pub thermo: Option<FileOutput>,
+    pub thermo: Option<ThermoOutput>,
     /// Checkpoint output.
     #[serde(default)]
     pub checkpoint: Option<FileOutput>,
@@ -396,6 +410,18 @@ impl RunConfig {
                 "/barostat",
             ));
         }
+        let pressure_tensor = self
+            .output
+            .as_ref()
+            .and_then(|o| o.thermo.as_ref())
+            .is_some_and(|t| t.pressure_tensor);
+        if pressure_tensor && !system.periodicity.iter().all(|&p| p) {
+            return Err(SpecError::new(
+                ErrorCode::Incompatible,
+                "the pressure tensor needs a fully periodic system",
+                "/output/thermo/pressure_tensor",
+            ));
+        }
         if self.momentum.as_ref().is_some_and(|m| m.remove_angular) && system.is_periodic() {
             return Err(SpecError::new(
                 ErrorCode::Incompatible,
@@ -444,6 +470,30 @@ pub struct MachineProfile {
     /// Absolute paths of external programs by name.
     #[serde(default)]
     pub executables: BTreeMap<String, PathBuf>,
+    /// The simulation backend (E3.7, ADR 0010): the reference CPU engine by default.
+    #[serde(default)]
+    pub backend: Option<BackendSection>,
+}
+
+/// `[backend]` of the machine profile: which hardware runs `ucmd run` (E3.7, ADR 0010).
+///
+/// `kind = "reference"` (default) is the engine itself. `kind = "openmm"` hands the run to the
+/// external program `[executables] ucmd-openmm` (the OpenMM bridge) after a conformance single
+/// point; `platform`, `precision` and `device` are passed to it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackendSection {
+    /// "reference" or "openmm".
+    pub kind: String,
+    /// OpenMM platform, e.g. "OpenCL" (default), "CPU", "Reference".
+    #[serde(default)]
+    pub platform: Option<String>,
+    /// "double" (default), "mixed" or "single".
+    #[serde(default)]
+    pub precision: Option<String>,
+    /// Device index on the platform, e.g. "0".
+    #[serde(default)]
+    pub device: Option<String>,
 }
 
 impl MachineProfile {
@@ -468,6 +518,19 @@ impl MachineProfile {
             .map_err(|e| SpecError::new(ErrorCode::Toml, e.to_string(), &location))?;
         let profile: Self = toml::from_str(&text)
             .map_err(|e| SpecError::new(ErrorCode::Schema, e.to_string(), &location))?;
+        if let Some(b) = &profile.backend {
+            let ok = ["reference", "openmm"].contains(&b.kind.as_str())
+                && b.precision
+                    .as_deref()
+                    .is_none_or(|p| ["double", "mixed", "single"].contains(&p));
+            if !ok {
+                return Err(SpecError::new(
+                    ErrorCode::Schema,
+                    "backend: kind must be \"reference\" or \"openmm\", precision \"double\", \"mixed\" or \"single\"",
+                    &location,
+                ));
+            }
+        }
         if let Some((name, exe)) = profile.executables.iter().find(|(_, p)| !p.is_absolute()) {
             return Err(SpecError::new(
                 ErrorCode::Path,
@@ -479,5 +542,40 @@ impl MachineProfile {
             ));
         }
         Ok(profile)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::{FileOutput, ThermoOutput};
+
+    /// Spec 0.1.1 added `pressure_tensor` to `[output.thermo]`. Without it the resolved
+    /// configuration must serialize exactly as before, or the restart fingerprint of every run
+    /// started before the change would differ and its restart would be refused.
+    #[test]
+    fn thermo_without_pressure_tensor_serializes_as_before() {
+        let old = FileOutput {
+            file: "thermo.tsv".into(),
+            every: 10,
+        };
+        let new = ThermoOutput {
+            file: "thermo.tsv".into(),
+            every: 10,
+            pressure_tensor: false,
+        };
+        assert_eq!(
+            toml::to_string(&old).unwrap(),
+            toml::to_string(&new).unwrap()
+        );
+        let with = ThermoOutput {
+            pressure_tensor: true,
+            ..new
+        };
+        assert!(
+            toml::to_string(&with)
+                .unwrap()
+                .contains("pressure_tensor = true")
+        );
     }
 }

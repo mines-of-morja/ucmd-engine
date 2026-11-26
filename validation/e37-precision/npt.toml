@@ -1,0 +1,55 @@
+# ADR 0012 precision check: 1 ns NPT of pure EMC at 25 °C, run once in double, once in mixed
+# precision on the GPU backend (same package, same seed). Lehnert 2025 settings with the LJ tail
+# correction on (ADR 0009 amendment 2026-11-17).
+spec_version = "0.1.0"
+system = "../emc.ucsys"
+title = "ADR 0012 precision check: pure EMC, NPT, 25 °C"
+
+[run]
+integrator = "velocity-verlet"
+timestep_fs = 1.0
+steps = 1000000
+seed = 2012
+
+[velocities]
+generate = "maxwell-boltzmann"
+temperature_K = 298.15
+
+[momentum]
+remove_com_every = 100
+
+[thermostat]
+kind = "nose-hoover-chain"
+temperature_K = 298.15
+tau_ps = 0.1
+chain_length = 3
+
+[barostat]
+kind = "c-rescale"
+pressure_bar = 1.01325
+tau_ps = 1.0
+compressibility_per_bar = 4.5e-5
+every = 25
+
+[[providers]]
+kind = "force-field"
+cutoff_nm = 1.4
+coulomb = "pme"
+ewald_tolerance = 1e-5
+dispersion_correction = true
+
+[output]
+directory = "out"
+
+[output.thermo]
+file = "thermo.tsv"
+every = 100
+
+[output.trajectory]
+file = "trajectory.h5"
+every = 2000
+precision = "float32"
+
+[output.checkpoint]
+file = "checkpoint.ucchk"
+every = 100000

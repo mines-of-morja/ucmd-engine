@@ -1,0 +1,45 @@
+# E2.7 acceptance: argon NPT with C-rescale, compared with OpenMM's MonteCarloBarostat (REPORT.md).
+# Rahman 1964 argon (pre-approved fixture); LJ shifted at 0.85 nm without tail correction, the same
+# Hamiltonian as the OpenMM side. 100 bar keeps the cut-off LJ liquid safely away from its vapour
+# pressure at 94.4 K. tau_p and the compressibility set only the relaxation rate, not the density.
+spec_version = "0.1.0"
+system = "out/equilibrated.ucsys"
+title = "E2.7 argon NPT: C-rescale at 94.4 K and 100 bar"
+
+[run]
+integrator = "velocity-verlet"
+timestep_fs = 4.0
+steps = 137500
+seed = 2027
+
+[velocities]
+generate = "maxwell-boltzmann"
+temperature_K = 94.4
+
+[momentum]
+remove_com_every = 1000
+
+[thermostat]
+kind = "csvr"
+temperature_K = 94.4
+tau_ps = 0.5
+
+[barostat]
+kind = "c-rescale"
+pressure_bar = 100.0
+tau_ps = 1.0
+compressibility_per_bar = 2e-4
+every = 10
+
+[[providers]]
+kind = "lennard-jones"
+cutoff_nm = 0.85
+cutoff_mode = "potential-shift"
+dispersion_correction = false
+
+[output]
+directory = "out/ucmd"
+
+[output.thermo]
+file = "thermo.tsv"
+every = 25

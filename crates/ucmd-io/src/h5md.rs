@@ -1,5 +1,6 @@
 //! H5MD 1.1 trajectory writer following spec/trajectory-h5md.md (ADR 0004).
 
+use crate::checkpoint::RestartRecord;
 use hdf5::types::VarLenUnicode;
 use hdf5::{Dataset, File, Group};
 use ndarray::{Array2, s};
@@ -57,6 +58,94 @@ fn attr_text(group: &Group, name: &str, value: &str) -> Result<(), ObserverError
         .and_then(|a| a.write_scalar(&value).map(|()| a))
         .map(|_| ())
         .map_err(err(name))
+}
+
+fn scalar_dataset(group: &Group, name: &str, value: &str) -> Result<(), ObserverError> {
+    let value = text(value)?;
+    group
+        .new_dataset::<VarLenUnicode>()
+        .create(name)
+        .and_then(|d| d.write_scalar(&value).map(|()| d))
+        .map(|_| ())
+        .map_err(err(name))
+}
+
+/// Append one restart to `/parameters/ucmd/restarts` as group `NNN` (000, 001, …).
+fn record_restart(file: &File, restart: &RestartRecord) -> Result<(), ObserverError> {
+    let ucmd = file
+        .group("parameters/ucmd")
+        .map_err(err("parameters/ucmd"))?;
+    let restarts = match ucmd.group("restarts") {
+        Ok(group) => group,
+        Err(_) => ucmd.create_group("restarts").map_err(err("restarts"))?,
+    };
+    let name = format!("{:03}", restarts.len());
+    let g = restarts.create_group(&name).map_err(err("restart"))?;
+    let step = i64::try_from(restart.step)
+        .map_err(|_| ObserverError(format!("H5MD restart: step {} too large", restart.step)))?;
+    g.new_attr::<i64>()
+        .create("step")
+        .and_then(|a| a.write_scalar(&step).map(|()| a))
+        .map_err(err("step"))?;
+    g.new_attr::<f64>()
+        .create("time_ps")
+        .and_then(|a| a.write_scalar(&restart.time_ps).map(|()| a))
+        .map_err(err("time_ps"))?;
+    attr_text(&g, "forced", if restart.forced { "true" } else { "false" })?;
+    attr_text(&g, "differences", &restart.differences.join("\n"))?;
+    attr_text(&g, "engine_version", &restart.engine_version)?;
+    attr_text(&g, "engine_git_hash", &restart.engine_git_hash)?;
+    attr_text(&g, "hardware", &restart.hardware)?;
+    scalar_dataset(&g, "run_config_toml", &restart.run_config_toml)
+}
+
+/// The restarts recorded in a trajectory, oldest first (empty for a run never restarted).
+pub fn read_restarts(path: &Path) -> Result<Vec<RestartRecord>, ObserverError> {
+    let file = File::open(path).map_err(err("open"))?;
+    let Ok(restarts) = file.group("parameters/ucmd/restarts") else {
+        return Ok(Vec::new());
+    };
+    let mut names = restarts.member_names().map_err(err("restarts"))?;
+    names.sort();
+    let read_text = |g: &Group, name: &str| -> Result<String, ObserverError> {
+        g.attr(name)
+            .and_then(|a| a.read_scalar::<VarLenUnicode>())
+            .map(|v| v.as_str().to_string())
+            .map_err(err(name))
+    };
+    names
+        .iter()
+        .map(|name| {
+            let g = restarts.group(name).map_err(err("restart"))?;
+            let step: i64 = g
+                .attr("step")
+                .and_then(|a| a.read_scalar())
+                .map_err(err("step"))?;
+            let differences = read_text(&g, "differences")?;
+            Ok(RestartRecord {
+                step: u64::try_from(step)
+                    .map_err(|_| ObserverError("H5MD: negative step".into()))?,
+                time_ps: g
+                    .attr("time_ps")
+                    .and_then(|a| a.read_scalar())
+                    .map_err(err("time_ps"))?,
+                forced: read_text(&g, "forced")? == "true",
+                differences: differences
+                    .lines()
+                    .map(str::to_string)
+                    .filter(|l| !l.is_empty())
+                    .collect(),
+                engine_version: read_text(&g, "engine_version")?,
+                engine_git_hash: read_text(&g, "engine_git_hash")?,
+                hardware: read_text(&g, "hardware")?,
+                run_config_toml: g
+                    .dataset("run_config_toml")
+                    .and_then(|d| d.read_scalar::<VarLenUnicode>())
+                    .map(|v| v.as_str().to_string())
+                    .map_err(err("run_config_toml"))?,
+            })
+        })
+        .collect()
 }
 
 fn unit(dataset: &Dataset, value: &str) -> Result<(), ObserverError> {
@@ -405,14 +494,16 @@ impl H5mdWriter {
 }
 
 impl H5mdWriter {
-    /// Reopen after a restart: every element is cut back to the frames up to `last_step` and
-    /// writing continues from there (spec/checkpoint.md).
+    /// Reopen after a restart: every element is cut back to the frames up to the restart step
+    /// and writing continues from there (spec/checkpoint.md). The restart is recorded in
+    /// `/parameters/ucmd/restarts`.
     pub fn open_append(
         path: &Path,
         system: &System,
         options: H5mdOptions,
-        last_step: u64,
+        restart: &RestartRecord,
     ) -> Result<Self, ObserverError> {
+        let last_step = restart.step;
         let missing = |what: &str| {
             ObserverError(format!(
                 "H5MD restart: {what} missing in {}",
@@ -420,6 +511,7 @@ impl H5mdWriter {
             ))
         };
         let file = File::open_rw(path).map_err(err("open"))?;
+        record_restart(&file, restart)?;
         let all = file.group("particles/all").map_err(err("particles/all"))?;
         let box_group = all.group("box").map_err(err("box"))?;
         let edges =

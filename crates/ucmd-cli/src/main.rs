@@ -12,8 +12,11 @@ mod runner;
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
+use signal_hook::consts::{SIGINT, SIGTERM};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 use ucmd_core::State;
 use ucmd_core::units::{BAR_PER_KJMOL_NM3, PS_PER_FS};
@@ -22,9 +25,13 @@ use ucmd_io::{
     MachineProfile, Package, RunConfig, SpecError, ThermostatSection, load_run_config, read_package,
 };
 use ucmd_md::kinetics::{degrees_of_freedom, remove_angular_momentum, remove_com_velocity};
-use ucmd_md::random::{STREAM_THERMOSTAT, STREAM_VELOCITIES, stream};
+use ucmd_md::random::{
+    STREAM_BAROSTAT, STREAM_CONFORMANCE, STREAM_THERMOSTAT, STREAM_VELOCITIES, stream,
+};
 use ucmd_md::velocities::maxwell_boltzmann;
-use ucmd_md::{Csvr, Dynamics, DynamicsConfig, Langevin, NoseHooverChain, Thermostat};
+use ucmd_md::{
+    CRescale, CRescaleConfig, Csvr, Dynamics, DynamicsConfig, Langevin, NoseHooverChain, Thermostat,
+};
 
 /// Engine version and git commit, for provenance.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -133,12 +140,30 @@ fn main() -> ExitCode {
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("error: {e:#}");
-            ExitCode::FAILURE
-        }
+        // the shell convention for a process ended by a signal: 128 + its number
+        Err(e) => match e.downcast_ref::<Stopped>() {
+            Some(stop) => ExitCode::from(u8::try_from(128 + stop.signal).unwrap_or(1)),
+            None => {
+                eprintln!("error: {e:#}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }
+
+/// A run that ended early on request; carries the signal number for the exit status.
+#[derive(Debug)]
+struct Stopped {
+    signal: usize,
+}
+
+impl std::fmt::Display for Stopped {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "stopped by signal {}", self.signal)
+    }
+}
+
+impl std::error::Error for Stopped {}
 
 fn spec(e: SpecError) -> anyhow::Error {
     anyhow!("{e}")
@@ -272,6 +297,7 @@ fn minimize(run_toml: &Path, out: &Path, max_force: f64, max_steps: u64) -> Resu
         s.package.system.masses(),
         &mut positions,
         state.cell.as_ref(),
+        &ucmd_md::Constraints::from_system(&s.package.system),
         &config,
         |step, energy, force| {
             if step % 100 == 0 {
@@ -349,7 +375,11 @@ fn initial_state(s: &Setup, dof: f64) -> State {
     state
 }
 
-fn observers(s: &Setup, restart_step: Option<u64>) -> Result<Vec<Box<dyn Observer>>> {
+fn observers(
+    s: &Setup,
+    restart: Option<&ucmd_io::RestartRecord>,
+) -> Result<Vec<Box<dyn Observer>>> {
+    let restart_step = restart.map(|r| r.step);
     let mut list: Vec<Box<dyn Observer>> = Vec::new();
     let Some(output) = &s.config.output else {
         return Ok(list);
@@ -360,10 +390,15 @@ fn observers(s: &Setup, restart_step: Option<u64>) -> Result<Vec<Box<dyn Observe
     if let Some(thermo) = &output.thermo {
         let path = dir.join(&thermo.file);
         list.push(Box::new(match restart_step {
-            Some(step) => {
-                ucmd_io::ThermoWriter::open_append(&path, thermo.every, step).map_err(e)?
-            }
-            None => ucmd_io::ThermoWriter::create(&path, thermo.every).map_err(e)?,
+            Some(step) => ucmd_io::ThermoWriter::open_append(
+                &path,
+                thermo.every,
+                step,
+                thermo.pressure_tensor,
+            )
+            .map_err(e)?,
+            None => ucmd_io::ThermoWriter::create(&path, thermo.every, thermo.pressure_tensor)
+                .map_err(e)?,
         }));
     }
     if let Some(trajectory) = &output.trajectory {
@@ -378,7 +413,7 @@ fn observers(s: &Setup, restart_step: Option<u64>) -> Result<Vec<Box<dyn Observe
                 None => ucmd_io::XyzWriter::create(&path, trajectory.every, elements).map_err(e)?,
             }));
         } else {
-            list.push(h5md_writer(s, &path, trajectory, restart_step)?);
+            list.push(h5md_writer(s, &path, trajectory, restart)?);
         }
     }
     Ok(list)
@@ -389,7 +424,7 @@ fn h5md_writer(
     s: &Setup,
     path: &Path,
     t: &ucmd_io::TrajectoryOutput,
-    restart_step: Option<u64>,
+    restart: Option<&ucmd_io::RestartRecord>,
 ) -> Result<Box<dyn Observer>> {
     let options = ucmd_io::H5mdOptions {
         every: t.every,
@@ -397,8 +432,8 @@ fn h5md_writer(
         forces: t.forces,
         float32: t.precision.as_deref() == Some("float32"),
     };
-    let writer = match restart_step {
-        Some(step) => ucmd_io::H5mdWriter::open_append(path, &s.package.system, options, step),
+    let writer = match restart {
+        Some(record) => ucmd_io::H5mdWriter::open_append(path, &s.package.system, options, record),
         None => {
             let provenance = ucmd_io::H5mdProvenance {
                 engine_version: VERSION.into(),
@@ -425,7 +460,7 @@ fn h5md_writer(
     _: &Setup,
     path: &Path,
     _: &ucmd_io::TrajectoryOutput,
-    _: Option<u64>,
+    _: Option<&ucmd_io::RestartRecord>,
 ) -> Result<Box<dyn Observer>> {
     bail!(
         "{}: this build has no H5MD support (feature \"h5md\"); use a .xyz trajectory",
@@ -433,18 +468,135 @@ fn h5md_writer(
     )
 }
 
+/// Displacement (nm, standard deviation per component) of the conformance configuration: thermal
+/// size, so that relative force differences are meaningful even for a minimized start.
+const CONFORMANCE_DISPLACEMENT_NM: f64 = 0.01;
+
+/// E3.7 (ADR 0010): hand the run to an external backend after writing the reference single
+/// point it must reproduce. The configuration is the package's start positions, displaced by a
+/// seeded 0.01 nm; the backend evaluates exactly these positions and refuses to run if energy
+/// or forces differ beyond the tolerances in the reference file.
+fn run_external_backend(
+    s: &Setup,
+    run_toml: &Path,
+    restart: Option<&Path>,
+    force: bool,
+    backend: &ucmd_io::BackendSection,
+) -> Result<()> {
+    let exe = s.machine.executables.get("ucmd-openmm").ok_or_else(|| {
+        anyhow!("backend \"openmm\" needs [executables] ucmd-openmm in the machine profile")
+    })?;
+    let state = &s.package.state;
+    let mut rng = stream(s.config.run.seed, STREAM_CONFORMANCE);
+    let mut noise = || CONFORMANCE_DISPLACEMENT_NM * ucmd_md::random::standard_normal(&mut rng);
+    let positions: Vec<ucmd_core::Vec3> = state
+        .positions
+        .iter()
+        .map(|r| *r + ucmd_core::Vec3::new(noise(), noise(), noise()))
+        .collect();
+    let mut provider = Guarded::new(registry::make_providers(&s.config, state)?);
+    provider
+        .initialize(&s.package.system)
+        .map_err(|e| anyhow!("{e}"))?;
+    let mut out = ForceResult::default();
+    let request = EvalRequest {
+        need_virial: provider.capabilities().virial,
+        ..EvalRequest::everything()
+    };
+    provider
+        .evaluate(&positions, state.cell.as_ref(), &request, &mut out)
+        .map_err(|e| anyhow!("{e}"))?;
+    let dir = s.config.output_dir().join("backend-reference");
+    std::fs::create_dir_all(&dir)?;
+    ucmd_io::npy::write_vec3_array(&dir.join("positions.npy"), &positions)?;
+    ucmd_io::npy::write_vec3_array(&dir.join("forces.npy"), &out.forces)?;
+    let cell = state
+        .cell
+        .as_ref()
+        .map(|c| c.rows().iter().map(|v| v.to_array()).collect::<Vec<_>>());
+    let reference = serde_json::json!({
+        "energy_kjmol": out.energy,
+        "cell_nm": cell,
+        "displacement_nm": CONFORMANCE_DISPLACEMENT_NM,
+        "tolerance_energy_relative": 1e-6,
+        "tolerance_force_relative": 1e-5,
+        "engine": format!("ucmd {VERSION} ({GIT_HASH})"),
+        "system_sha256": s.package.system.system_sha256,
+    });
+    std::fs::write(
+        dir.join("reference.json"),
+        serde_json::to_string_pretty(&reference)?,
+    )?;
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("run")
+        .arg(run_toml)
+        .arg("--reference")
+        .arg(&dir)
+        .arg("--platform")
+        .arg(backend.platform.as_deref().unwrap_or("OpenCL"))
+        .arg("--precision")
+        .arg(backend.precision.as_deref().unwrap_or("double"));
+    if let Some(d) = &backend.device {
+        command.arg("--device").arg(d);
+    }
+    if let Some(r) = restart {
+        command.arg("--restart").arg(r);
+    }
+    if force {
+        command.arg("--force");
+    }
+    eprintln!(
+        "ucmd {VERSION} ({GIT_HASH}): backend openmm via {} (reference single point in {})",
+        exe.display(),
+        dir.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // exec: the backend receives SIGINT/SIGTERM directly and stops gracefully itself
+        Err(anyhow!(
+            "could not start {}: {}",
+            exe.display(),
+            command.exec()
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let status = command.status()?;
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
 fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
     let s = setup(run_toml)?;
+    if let Some(b) = s.machine.backend.as_ref().filter(|b| b.kind == "openmm") {
+        return run_external_backend(&s, run_toml, restart, force, b);
+    }
     let system = &s.package.system;
     let checkpoint = restart
         .map(ucmd_io::Checkpoint::read)
         .transpose()
         .map_err(|e| anyhow!("{e}"))?;
     let fingerprint = s.config.fingerprint();
+    let mut differences = Vec::new();
     if let Some(c) = &checkpoint {
-        let same =
-            c.meta.system_sha256 == system.system_sha256 && c.meta.run_config_sha256 == fingerprint;
-        if !same && !force {
+        let short = |hash: &str| hash.chars().take(12).collect::<String>();
+        if c.meta.system_sha256 != system.system_sha256 {
+            differences.push(format!(
+                "system.json: {} -> {}",
+                short(&c.meta.system_sha256),
+                short(&system.system_sha256)
+            ));
+        }
+        if c.meta.run_config_sha256 != fingerprint {
+            differences.push(format!(
+                "run configuration: {} -> {}",
+                short(&c.meta.run_config_sha256),
+                short(&fingerprint)
+            ));
+        }
+        if !differences.is_empty() && !force {
             bail!(
                 "E_RESTART_MISMATCH  the package or run configuration differ from the checkpoint's (use --force to override)"
             );
@@ -503,9 +655,40 @@ fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
             )))
         }
     };
-    if s.config.barostat.is_some() {
-        bail!("barostats arrive in E2.7");
-    }
+    let barostat = match &s.config.barostat {
+        None => None,
+        Some(b) => {
+            if b.coupling.as_deref() == Some("anisotropic") {
+                bail!("anisotropic pressure coupling is not implemented yet (E2.7 has isotropic)");
+            }
+            let temperature_k = match &s.config.thermostat {
+                Some(
+                    ThermostatSection::Csvr { temperature_k, .. }
+                    | ThermostatSection::NoseHooverChain { temperature_k, .. }
+                    | ThermostatSection::Langevin { temperature_k, .. },
+                ) => *temperature_k,
+                None => bail!("a barostat needs a thermostat: C-rescale takes its temperature"),
+            };
+            let rng = match checkpoint
+                .as_ref()
+                .and_then(|c| c.meta.barostat_rng.clone())
+            {
+                Some(saved) => serde_json::from_value::<rand_chacha::ChaCha8Rng>(saved)?,
+                None => stream(s.config.run.seed, STREAM_BAROSTAT),
+            };
+            let config = CRescaleConfig {
+                pressure_bar: b.pressure_bar,
+                tau_ps: b.tau_ps,
+                compressibility_per_bar: b.compressibility_per_bar,
+                every: b.every.unwrap_or(10),
+                temperature_k,
+            };
+            Some(
+                CRescale::new(config, rng)
+                    .ok_or_else(|| anyhow!("barostat parameters out of range"))?,
+            )
+        }
+    };
     let provider = registry::make_providers(&s.config, &state)?;
     let remove_com_every = s.config.momentum.as_ref().map_or(0, |m| m.remove_com_every);
     // The centre-of-mass momentum stays zero under NVE, CSVR and Nosé–Hoover chains, but
@@ -523,9 +706,13 @@ fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
     };
     let mut dynamics =
         Dynamics::new(system, provider, state, config, thermostat).map_err(|e| anyhow!("{e}"))?;
+    if let Some(b) = barostat {
+        dynamics = dynamics.with_barostat(b).map_err(|e| anyhow!("{e}"))?;
+    }
     let start_step = dynamics.state().step;
     if let Some(c) = &checkpoint {
         dynamics.restore_thermostat_work(c.meta.thermostat_work_kjmol);
+        dynamics.restore_barostat_work(c.meta.barostat_work_kjmol);
         if let Err(e) = dynamics.restore_thermostat_state(&c.meta.thermostat_state) {
             let file = restart.unwrap_or(Path::new("")).display();
             if !force {
@@ -535,7 +722,18 @@ fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
             eprintln!("warning: {file}: {e}; the thermostat starts from a fresh state (--force)");
         }
     }
-    let mut observers = observers(&s, checkpoint.as_ref().map(|c| c.meta.step))?;
+    // every restart goes into the trajectory's provenance; a forced one with its differences
+    let restart = checkpoint.as_ref().map(|c| ucmd_io::RestartRecord {
+        step: c.meta.step,
+        time_ps: c.meta.time_ps,
+        forced: !differences.is_empty(),
+        differences: differences.clone(),
+        engine_version: VERSION.into(),
+        engine_git_hash: GIT_HASH.into(),
+        hardware: hardware::describe(s.threads),
+        run_config_toml: s.config.resolved_toml(),
+    });
+    let mut observers = observers(&s, restart.as_ref())?;
     let steps = s.config.run.steps.saturating_sub(start_step);
     let out_dir = s.config.output_dir();
     std::fs::create_dir_all(&out_dir)?;
@@ -563,6 +761,8 @@ fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
         thermostat_work_kjmol: 0.0,
         thermostat_rng: None,
         thermostat_state: Vec::new(),
+        barostat_work_kjmol: 0.0,
+        barostat_rng: None,
     };
     eprintln!(
         "ucmd {VERSION} ({GIT_HASH}): {} atoms, steps {start_step}..{} of {} fs, N_dof = {}{}\n  hardware: {}",
@@ -577,6 +777,15 @@ fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
         },
         hardware::describe(s.threads)
     );
+    // A first SIGINT or SIGTERM asks for a graceful stop: finish the step, write the checkpoint,
+    // close the outputs. A second one ends the process at once.
+    let stop = Arc::new(AtomicBool::new(false));
+    let signal = Arc::new(AtomicUsize::new(0));
+    for sig in [SIGINT, SIGTERM] {
+        signal_hook::flag::register_conditional_shutdown(sig, 128 + sig, Arc::clone(&stop))?;
+        signal_hook::flag::register(sig, Arc::clone(&stop))?;
+        signal_hook::flag::register_usize(sig, Arc::clone(&signal), sig as usize)?;
+    }
     let started = Instant::now();
     let outcome = runner::drive(
         &mut dynamics,
@@ -586,11 +795,25 @@ fn run(run_toml: &Path, restart: Option<&Path>, force: bool) -> Result<()> {
         plan.as_ref(),
         &emergency,
         &base,
+        &|| stop.load(Ordering::Relaxed),
     );
     for observer in &mut observers {
         observer.finish().map_err(|e| anyhow!("{e}"))?;
     }
-    outcome?;
+    if let runner::Outcome::Stopped { step } = outcome? {
+        let sig = signal.load(Ordering::Relaxed);
+        let path = plan.as_ref().map_or(&emergency, |p| &p.path);
+        eprintln!(
+            "stopped by {} after step {step}; the state is in {} (continue with --restart)",
+            if sig == SIGINT as usize {
+                "SIGINT"
+            } else {
+                "SIGTERM"
+            },
+            path.display()
+        );
+        return Err(Stopped { signal: sig }.into());
+    }
     let seconds = started.elapsed().as_secs_f64();
     let ns = steps as f64 * s.config.run.timestep_fs * 1e-6;
     eprintln!(

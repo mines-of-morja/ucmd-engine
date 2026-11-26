@@ -1,0 +1,7 @@
+studies/2026-11-23_water-pressure-vs-density/runs/spcfw_512_rho1012/T25.01C/run.toml: 100000 steps, 1000 pressure evaluations, label exchanges 4748
+      block (ps)   stepping    probe   energy-only   stepping-probe   probe-energy
+     0.0-  20.0      139.1     139.1       137.9            0.0            1.2
+    20.0-  40.0      209.9     209.1       211.9            0.8           -2.8
+    40.0-  60.0      276.0     274.2       272.8            1.7            1.4
+    60.0-  80.0      292.8     291.8       291.9            1.0           -0.1
+    80.0- 100.0      296.6     294.9       296.1            1.7           -1.2

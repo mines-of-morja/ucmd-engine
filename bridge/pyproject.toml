@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ucmd-bridge"
+version = "0.1.0.dev0"
+description = "UnitcellMD bridge: external backends for ucmd run (E3.7: OpenMM on GPUs)"
+license = "Apache-2.0"
+requires-python = ">=3.12"
+dependencies = ["numpy>=1.26", "h5py>=3.10"]
+
+[project.optional-dependencies]
+openmm = ["openmm>=8.1"]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+ucmd-openmm = "ucmd_bridge.openmm_backend:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003"]  # Greek letters and dashes in physics text

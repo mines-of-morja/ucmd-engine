@@ -15,6 +15,8 @@ pub const STREAM_VELOCITIES: u64 = 1;
 pub const STREAM_THERMOSTAT: u64 = 2;
 /// Stream of the barostat (E2.7).
 pub const STREAM_BAROSTAT: u64 = 3;
+/// Stream of the displacements of the backend conformance check (E3.7).
+pub const STREAM_CONFORMANCE: u64 = 4;
 
 /// The generator of stream `stream` for master seed `seed`.
 pub fn stream(seed: u64, stream: u64) -> ChaCha8Rng {
