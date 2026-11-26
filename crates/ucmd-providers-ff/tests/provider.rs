@@ -10,7 +10,7 @@
 
 use ucmd_core::{
     Angle, AngleForm, AtomTemplate, AtomType, Bond, BondForm, Cell, CombinationRule, ForceField,
-    MoleculeType, System, Torsion, TorsionForm, Vec3,
+    MoleculeType, PairOverride, System, Torsion, TorsionForm, Vec3,
 };
 use ucmd_force::testkit::{
     FdOptions, determinism_check, energy_terms_check, fd_force_check, fd_virial_check,
@@ -82,6 +82,7 @@ fn water2(periodicity: [bool; 3]) -> System {
                 epsilon_kjmol: 0.0,
             },
         ],
+        pair_overrides: vec![],
     };
     System::new("water-2", vec![water], &[(0, 2)], Some(ff), periodicity).unwrap()
 }
@@ -217,6 +218,7 @@ fn all_forms(periodicity: [bool; 3]) -> System {
                 epsilon_kjmol: 0.2,
             },
         ],
+        pair_overrides: vec![],
     };
     System::new("allforms", vec![molecule], &[(0, 2)], Some(ff), periodicity).unwrap()
 }
@@ -424,4 +426,21 @@ fn unsupported_systems_and_settings_are_errors() {
         p.evaluate(&water2_positions(), Some(&cell()), &req, &mut out),
         Err(ForceError::InvalidInput(_))
     ));
+}
+
+#[test]
+fn pair_overrides_are_refused_not_ignored() {
+    // ucmd-ff v0.1.0 has no per-pair table; ignoring the override would compute other physics
+    let mut system = all_forms([true, true, true]);
+    let ff = system.forcefield.as_mut().unwrap();
+    ff.pair_overrides.push(PairOverride {
+        types: [0, 1],
+        sigma_nm: 0.2,
+        epsilon_kjmol: 0.1,
+    });
+    let mut p = UcmdFf::new("ucmd-ff", periodic_config());
+    let error = p
+        .initialize(&system)
+        .expect_err("a package with pair overrides must be refused");
+    assert!(error.to_string().contains("pair overrides"), "{error}");
 }

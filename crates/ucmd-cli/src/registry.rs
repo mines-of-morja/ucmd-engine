@@ -13,7 +13,7 @@ use ucmd_providers_ff::{UcmdFf, UcmdFfConfig};
 use ucmd_providers_ipi::{IpiProvider, IpiProviderConfig};
 
 /// The provider kinds this build knows.
-pub const KINDS: [&str; 6] = [
+pub const KINDS: [&str; 7] = [
     "bonded",
     "force-field",
     "harmonic-tether",

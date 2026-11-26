@@ -140,6 +140,12 @@ fn convert(system: &System) -> Result<ff::System, ForceError> {
         .forcefield
         .as_ref()
         .ok_or_else(|| unsupported("needs a parameterized package (no forcefield section)"))?;
+    if !params.pair_overrides.is_empty() {
+        // ucmd-ff v0.1.0 knows only the combination rule: running would silently use other pairs
+        return Err(unsupported(
+            "pair overrides (spec 0.1.2) are not supported; use the provider kind \"force-field\"",
+        ));
+    }
     let mut molecule_types = Vec::with_capacity(system.molecule_types.len());
     for m in &system.molecule_types {
         let mut atoms = Vec::with_capacity(m.atoms.len());

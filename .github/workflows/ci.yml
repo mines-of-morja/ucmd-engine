@@ -9,10 +9,10 @@ permissions:
 
 env:
   # Umbrella commit whose spec/ fixtures and tools/oracle/ references this engine is tested
-  # against: spec v0.1.0 plus the E2 molecule references (umbrella branch e2). A tag or commit
+  # against: spec 0.1.3 (untagged) and the oracle references of umbrella main. A tag or commit
   # hash, never a moving branch; it moves in the same coordinated update as the references or
   # the spec (PLAN.md §9, spec churn).
-  UMBRELLA_REF: da27ef75f62860127d190635d97cdfee3a43078d
+  UMBRELLA_REF: 0e7befca83fa1d649192e6c7475ca8b528b6692f
 
 jobs:
   rust:
