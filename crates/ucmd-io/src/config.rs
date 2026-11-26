@@ -139,6 +139,10 @@ pub struct ThermoOutput {
     /// Not serialized when false, so the restart fingerprint of older runs stays the same.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pressure_tensor: bool,
+    /// Spec 0.1.3: also write the molecular pressure in bar. Not serialized when false, for the
+    /// same reason.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pressure_molecular: bool,
 }
 
 /// `[output.trajectory]`.
@@ -410,12 +414,15 @@ impl RunConfig {
                 "/barostat",
             ));
         }
-        let pressure_tensor = self
-            .output
-            .as_ref()
-            .and_then(|o| o.thermo.as_ref())
-            .is_some_and(|t| t.pressure_tensor);
-        if pressure_tensor && !system.periodicity.iter().all(|&p| p) {
+        let thermo = self.output.as_ref().and_then(|o| o.thermo.as_ref());
+        if thermo.is_some_and(|t| t.pressure_molecular) && !system.periodicity.iter().all(|&p| p) {
+            return Err(SpecError::new(
+                ErrorCode::Incompatible,
+                "the molecular pressure needs a fully periodic system",
+                "/output/thermo/pressure_molecular",
+            ));
+        }
+        if thermo.is_some_and(|t| t.pressure_tensor) && !system.periodicity.iter().all(|&p| p) {
             return Err(SpecError::new(
                 ErrorCode::Incompatible,
                 "the pressure tensor needs a fully periodic system",
@@ -550,11 +557,11 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::{FileOutput, ThermoOutput};
 
-    /// Spec 0.1.1 added `pressure_tensor` to `[output.thermo]`. Without it the resolved
+    /// Spec 0.1.1 added `pressure_tensor` to `[output.thermo]`, 0.1.3 `pressure_molecular`. Without them the resolved
     /// configuration must serialize exactly as before, or the restart fingerprint of every run
     /// started before the change would differ and its restart would be refused.
     #[test]
-    fn thermo_without_pressure_tensor_serializes_as_before() {
+    fn thermo_without_the_optional_columns_serializes_as_before() {
         let old = FileOutput {
             file: "thermo.tsv".into(),
             every: 10,
@@ -563,6 +570,7 @@ mod tests {
             file: "thermo.tsv".into(),
             every: 10,
             pressure_tensor: false,
+            pressure_molecular: false,
         };
         assert_eq!(
             toml::to_string(&old).unwrap(),
@@ -570,12 +578,11 @@ mod tests {
         );
         let with = ThermoOutput {
             pressure_tensor: true,
+            pressure_molecular: true,
             ..new
         };
-        assert!(
-            toml::to_string(&with)
-                .unwrap()
-                .contains("pressure_tensor = true")
-        );
+        let text = toml::to_string(&with).unwrap();
+        assert!(text.contains("pressure_tensor = true"));
+        assert!(text.contains("pressure_molecular = true"));
     }
 }

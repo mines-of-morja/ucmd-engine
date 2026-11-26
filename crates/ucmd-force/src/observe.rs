@@ -30,6 +30,9 @@ pub struct Snapshot<'a> {
     pub conserved_energy: Option<f64>,
     /// Pressure tensor in bar, if a virial and a cell are available.
     pub pressure_bar: Option<Mat3>,
+    /// Molecular pressure tensor in bar (spec/units.md §4: the pressure of the centres of mass
+    /// of bonded groups), under the same condition. Its trace / 3 drives the barostat.
+    pub molecular_pressure_bar: Option<Mat3>,
 }
 
 /// Failure of an observer (I/O and the like); stops the run.

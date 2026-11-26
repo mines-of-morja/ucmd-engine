@@ -117,32 +117,75 @@ pub struct Dynamics<P: ForceProvider> {
     barostat: Option<CRescale>,
     barostat_work: f64,
     constraints: Constraints,
-    /// Molecules with constraints as (first atom, atom count): the barostat scales them by their
-    /// centre of mass, so that the constraints stay satisfied (E2.5 step 2).
-    rigid: Vec<(usize, usize)>,
+    /// Groups of two or more atoms connected by bonds or constraints ([`bonded_groups`]): the
+    /// barostat scales them by their centre of mass. Constraints then stay satisfied (E2.5 step
+    /// 2), and the barostat's pressure has no finite-time-step bias from bond vibrations (SC-3,
+    /// option B). Any other atom is scaled on its own.
+    molecules: Vec<Vec<usize>>,
     /// Constraint virial of the current state (kJ/mol), included in `forces.virial`.
     constraint_virial: ucmd_core::Mat3,
 }
 
-/// Mass-weighted mean of `values` over atoms `first..first + n` (molecules are whole).
-fn molecular_mean(values: &[Vec3], masses: &[f64], first: usize, n: usize) -> Vec3 {
+/// Atoms connected by bonds or constraints, in groups of two or more, ascending. A molecule type
+/// may hold atoms that nothing connects (spec/system-package.md): they do not move as one body.
+fn bonded_groups(system: &System) -> Vec<Vec<usize>> {
+    // connected parts of each molecule type, by relabelling to the smallest index
+    let parts: Vec<Vec<Vec<usize>>> = system
+        .molecule_types
+        .iter()
+        .map(|t| {
+            let mut label: Vec<usize> = (0..t.atoms.len()).collect();
+            let links = t
+                .bonds
+                .iter()
+                .map(|b| b.atoms)
+                .chain(t.constraints.iter().map(|c| c.atoms));
+            for [i, j] in links {
+                let (low, high) = (label[i].min(label[j]), label[i].max(label[j]));
+                for l in &mut label {
+                    if *l == high {
+                        *l = low;
+                    }
+                }
+            }
+            let mut groups: Vec<Vec<usize>> = vec![vec![]; label.len()];
+            for (atom, &l) in label.iter().enumerate() {
+                groups[l].push(atom);
+            }
+            groups.retain(|g| g.len() > 1);
+            groups
+        })
+        .collect();
+    system
+        .instances
+        .iter()
+        .flat_map(|instance| {
+            parts[instance.molecule_type]
+                .iter()
+                .map(|g| g.iter().map(|&a| instance.first_atom + a).collect())
+        })
+        .collect()
+}
+
+/// Mass-weighted mean of `values` over the atoms of a group (molecules are whole).
+fn molecular_mean(values: &[Vec3], masses: &[f64], group: &[usize]) -> Vec3 {
     let mut sum = Vec3::ZERO;
     let mut mass = 0.0;
-    for k in first..first + n {
+    for &k in group {
         sum += values[k] * masses[k];
         mass += masses[k];
     }
     sum / mass
 }
 
-/// Kinetic tensor ½Σ m v⊗v conjugate to the barostat's scaling: atoms of rigid molecules count
+/// Kinetic tensor ½Σ m v⊗v conjugate to the barostat's scaling: atoms of `molecules` count
 /// through their centre-of-mass velocity only (kJ/mol).
-fn scaling_kinetic_tensor(v: &[Vec3], masses: &[f64], rigid: &[(usize, usize)]) -> ucmd_core::Mat3 {
+fn scaling_kinetic_tensor(v: &[Vec3], masses: &[f64], molecules: &[Vec<usize>]) -> ucmd_core::Mat3 {
     let mut k = kinetic_tensor(v, masses);
-    for &(first, n) in rigid {
-        let vc = molecular_mean(v, masses, first, n);
-        let mass: f64 = masses[first..first + n].iter().sum();
-        for i in first..first + n {
+    for group in molecules {
+        let vc = molecular_mean(v, masses, group);
+        let mass: f64 = group.iter().map(|&i| masses[i]).sum();
+        for &i in group {
             k -= ucmd_core::Mat3::from_cols(
                 v[i] * (0.5 * masses[i] * v[i].x),
                 v[i] * (0.5 * masses[i] * v[i].y),
@@ -159,18 +202,18 @@ fn scaling_kinetic_tensor(v: &[Vec3], masses: &[f64], rigid: &[(usize, usize)]) 
 }
 
 /// Virial conjugate to the barostat's scaling (kJ/mol): the provider's atomic virial minus, for
-/// rigid molecules, Σ (r_i − R_I) ⊗ F_i, which turns it into their molecular virial.
+/// `molecules`, Σ (r_i − R_I) ⊗ F_i, which turns it into their molecular virial.
 fn scaling_virial(
     provider_virial: ucmd_core::Mat3,
     x: &[Vec3],
     forces: &[Vec3],
     masses: &[f64],
-    rigid: &[(usize, usize)],
+    molecules: &[Vec<usize>],
 ) -> ucmd_core::Mat3 {
     let mut w = provider_virial;
-    for &(first, n) in rigid {
-        let r = molecular_mean(x, masses, first, n);
-        for i in first..first + n {
+    for group in molecules {
+        let r = molecular_mean(x, masses, group);
+        for &i in group {
             let d = x[i] - r;
             let f = forces[i];
             w -= ucmd_core::Mat3::from_cols(d * f.x, d * f.y, d * f.z);
@@ -228,21 +271,7 @@ impl<P: ForceProvider> Dynamics<P> {
             thermostat_work: 0.0,
             barostat: None,
             barostat_work: 0.0,
-            rigid: system
-                .instances
-                .iter()
-                .filter(|i| {
-                    !system.molecule_types[i.molecule_type]
-                        .constraints
-                        .is_empty()
-                })
-                .map(|i| {
-                    (
-                        i.first_atom,
-                        system.molecule_types[i.molecule_type].atoms.len(),
-                    )
-                })
-                .collect(),
+            molecules: bonded_groups(system),
             constraints,
             constraint_virial: ucmd_core::Mat3::ZERO,
         };
@@ -595,7 +624,7 @@ impl<P: ForceProvider> Dynamics<P> {
                 &self.spare_positions,
                 &self.next_forces.forces,
                 &self.masses,
-                &self.rigid,
+                &self.molecules,
             );
             let trace_w_after = w.x_axis.x + w.y_axis.y + w.z_axis.z;
             barostat_work += -0.5 * (trace_w_before + trace_w_after) * d_eps / 3.0;
@@ -614,6 +643,24 @@ impl<P: ForceProvider> Dynamics<P> {
         Ok(())
     }
 
+    /// Virial (kJ/mol) and pressure tensor (bar) conjugate to the scaling of [`Self::rescale`] for
+    /// the current state, from its total virial (which includes the constraint virial).
+    fn scaling_pressure(
+        &self,
+        virial: ucmd_core::Mat3,
+        volume: f64,
+    ) -> (ucmd_core::Mat3, ucmd_core::Mat3) {
+        let virial = scaling_virial(
+            virial - self.constraint_virial,
+            &self.state.positions,
+            &self.forces.forces,
+            &self.masses,
+            &self.molecules,
+        );
+        let kinetic = scaling_kinetic_tensor(&self.state.velocities, &self.masses, &self.molecules);
+        (virial, pressure_tensor_bar(kinetic, virial, volume))
+    }
+
     /// One C-rescale move: scale the spare positions and velocities. Returns the scaled cell,
     /// the energy the move puts into K + P₀V (kJ/mol), dε, and tr W of the state at the start
     /// of the step; the change of U is added after the force evaluation (trapezoid rule).
@@ -629,19 +676,7 @@ impl<P: ForceProvider> Dynamics<P> {
             .virial
             .ok_or_else(|| setup("barostat step without the virial of the current state"))?;
         let volume = cell.volume();
-        // pressure and virial conjugate to the scaling below (molecular for rigid molecules)
-        let virial = scaling_virial(
-            virial - self.constraint_virial,
-            &self.state.positions,
-            &self.forces.forces,
-            &self.masses,
-            &self.rigid,
-        );
-        let p = pressure_tensor_bar(
-            scaling_kinetic_tensor(&self.state.velocities, &self.masses, &self.rigid),
-            virial,
-            volume,
-        );
+        let (virial, p) = self.scaling_pressure(virial, volume);
         let pressure = (p.x_axis.x + p.y_axis.y + p.z_axis.z) / 3.0;
         let barostat = self.barostat.as_mut().ok_or_else(|| setup("no barostat"))?;
         let d_eps = barostat.d_log_volume(pressure, volume, dt);
@@ -651,13 +686,13 @@ impl<P: ForceProvider> Dynamics<P> {
             .scaled(mu)
             .map_err(|e| setup(&format!("barostat: the scaled cell is invalid: {e}")))?;
         let k_before = kinetic_energy(&self.spare_velocities, &self.masses);
-        // rigid molecules: shifted with their centre of mass, only its velocity scaled, so their
-        // constraints stay satisfied; every other atom: scaled on its own (E2.7)
+        // molecules: shifted with their centre of mass, only its velocity scaled, so the internal
+        // geometry (and any constraint) stays as it is; single atoms: scaled on their own
         let mut done = vec![false; self.spare_positions.len()];
-        for &(first, n) in &self.rigid {
-            let r = molecular_mean(&self.spare_positions, &self.masses, first, n);
-            let vc = molecular_mean(&self.spare_velocities, &self.masses, first, n);
-            for i in first..first + n {
+        for group in &self.molecules {
+            let r = molecular_mean(&self.spare_positions, &self.masses, group);
+            let vc = molecular_mean(&self.spare_velocities, &self.masses, group);
+            for &i in group {
                 self.spare_positions[i] += r * (mu - 1.0);
                 self.spare_velocities[i] += vc * (1.0 / mu - 1.0);
                 done[i] = true;
@@ -741,6 +776,10 @@ impl<P: ForceProvider> Dynamics<P> {
             )),
             _ => None,
         };
+        let molecular_pressure_bar = match (self.forces.virial, cell) {
+            (Some(w), Some(c)) => Some(self.scaling_pressure(w, c.volume()).1),
+            _ => None,
+        };
         Snapshot {
             step: self.state.step,
             time_ps: self.state.time_ps,
@@ -752,6 +791,7 @@ impl<P: ForceProvider> Dynamics<P> {
             temperature_k: self.temperature(),
             conserved_energy: self.conserved_energy(),
             pressure_bar,
+            molecular_pressure_bar,
         }
     }
 
@@ -2016,15 +2056,19 @@ mod tests {
     }
 
     /// Rigid dimers with LJ under NPT (C-rescale + CSVR), or the same dimers held by a stiff
-    /// harmonic bond. Returns (H range kJ/mol, volume range nm³, worst constraint violation).
-    fn dimer_npt(rigid: bool, dt: f64, steps: u64) -> (f64, f64, f64) {
+    /// harmonic bond; `bonded`: the topology says so and the barostat scales them as molecules.
+    /// Returns (H range kJ/mol, volume range nm³, worst constraint violation).
+    fn dimer_npt(rigid: bool, bonded: bool, dt: f64, steps: u64) -> (f64, f64, f64) {
         use crate::barostat::{CRescale, CRescaleConfig};
         use crate::random::{STREAM_BAROSTAT, STREAM_THERMOSTAT, STREAM_VELOCITIES, stream};
         use crate::thermostat::Csvr;
         use crate::velocities::maxwell_boltzmann;
         let (n, d, edge, t) = (64, 0.15, 2.4, 150.0);
         let constraints: &[(usize, usize, f64)] = if rigid { &[(0, 1, d)] } else { &[] };
-        let system = rigid_system(&[20.0, 20.0], constraints, n, [true; 3]);
+        let mut system = rigid_system(&[20.0, 20.0], constraints, n, [true; 3]);
+        if bonded {
+            system.molecule_types[0].bonds = vec![bond(0, 1)];
+        }
         let mut rng = stream(31, STREAM_VELOCITIES);
         let mut x = Vec::new();
         for k in 0..n {
@@ -2099,8 +2143,8 @@ mod tests {
     /// conserved quantity holds no worse than for the same dimers with a stiff harmonic bond.
     #[test]
     fn npt_with_constraints_conserves_h_like_a_stiff_bond() {
-        let (h_rigid, v_rigid, violation) = dimer_npt(true, 0.001, 20_000);
-        let (h_flex, v_flex, _) = dimer_npt(false, 0.001, 20_000);
+        let (h_rigid, v_rigid, violation) = dimer_npt(true, false, 0.001, 20_000);
+        let (h_flex, v_flex, _) = dimer_npt(false, false, 0.001, 20_000);
         eprintln!(
             "NPT dimers, 20 ps: rigid H range {h_rigid:.4} kJ/mol (V range {v_rigid:.3} nm³, \
              violation {violation:.1e}); stiff bond H range {h_flex:.4} (V range {v_flex:.3})"
@@ -2110,6 +2154,260 @@ mod tests {
         assert!(
             h_rigid <= h_flex,
             "constraints {h_rigid} vs stiff bond {h_flex} kJ/mol"
+        );
+        // SC-3 (option B): as molecules, the stiff dimers conserve H no worse than atom by atom
+        let (h_mol, v_mol, _) = dimer_npt(false, true, 0.001, 20_000);
+        eprintln!("stiff bond scaled as a molecule: H range {h_mol:.4} (V range {v_mol:.3})");
+        assert!(v_mol > 0.05, "the volume must move: {v_mol}");
+        assert!(
+            h_mol <= h_flex,
+            "molecular {h_mol} vs atomic scaling {h_flex}"
+        );
+    }
+
+    /// Dimers (atoms 2k, 2k+1) held by a harmonic bond, without any other interaction.
+    struct FreeDimers {
+        k: f64,
+        r0: f64,
+    }
+
+    impl ForceProvider for FreeDimers {
+        fn name(&self) -> &str {
+            "free-dimers"
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities {
+                periodic: true,
+                virial: true,
+                energy_terms: false,
+                deterministic: true,
+            }
+        }
+        fn initialize(&mut self, _: &System) -> Result<(), ForceError> {
+            Ok(())
+        }
+        fn evaluate(
+            &mut self,
+            x: &[Vec3],
+            _: Option<&Cell>,
+            _: &EvalRequest,
+            out: &mut ForceResult,
+        ) -> Result<(), ForceError> {
+            let mut e = 0.0;
+            let mut w = ucmd_core::Mat3::ZERO;
+            out.forces.clear();
+            for pair in x.chunks_exact(2) {
+                let r = pair[0] - pair[1];
+                let d = r.length();
+                let f = r * (-self.k * (d - self.r0) / d);
+                e += 0.5 * self.k * (d - self.r0).powi(2);
+                out.forces.push(f);
+                out.forces.push(-f);
+                w += ucmd_core::Mat3::from_cols(r * f.x, r * f.y, r * f.z);
+            }
+            out.energy = Some(e);
+            out.virial = Some(w);
+            Ok(())
+        }
+    }
+
+    fn bond(i: usize, j: usize) -> ucmd_core::Bond {
+        ucmd_core::Bond {
+            atoms: [i, j],
+            form: None,
+        }
+    }
+
+    /// `n` flexible dimers (20 and 1 amu): bonded in the topology, no constraint.
+    fn flexible_dimers(n: usize, periodicity: [bool; 3]) -> System {
+        let mut mtype = rigid_system(&[20.0, 1.0], &[], 1, periodicity).molecule_types[0].clone();
+        mtype.name = "flexible".into();
+        mtype.bonds = vec![bond(0, 1)];
+        System::new("flexible", vec![mtype], &[(0, n)], None, periodicity).unwrap()
+    }
+
+    /// Atoms move as one body only if bonds or constraints connect them.
+    #[test]
+    fn bonded_groups_follow_bonds_and_constraints() {
+        assert!(bonded_groups(&particles(&[1.0, 2.0, 3.0])).is_empty());
+        let dimers = bonded_groups(&flexible_dimers(2, [true; 3]));
+        assert_eq!(dimers, vec![vec![0, 1], vec![2, 3]]);
+        // 5 atoms: constraint 0–4, bonds 4–2 and 1–3 → two groups, not contiguous
+        let mut mtype =
+            rigid_system(&[1.0; 5], &[(0, 4, 0.1)], 1, [true; 3]).molecule_types[0].clone();
+        mtype.bonds = vec![bond(4, 2), bond(1, 3)];
+        let system = System::new("mixed", vec![mtype], &[(0, 2)], None, [true; 3]).unwrap();
+        assert_eq!(
+            bonded_groups(&system),
+            vec![vec![0, 2, 4], vec![1, 3], vec![5, 7, 9], vec![6, 8]]
+        );
+    }
+
+    /// `n_edge`³ dimers of bond length `d` on a lattice of spacing `a`, random orientations.
+    fn dimer_lattice(n_edge: usize, a: f64, d: f64, seed: u64) -> (Vec<Vec3>, Cell) {
+        use crate::random::{STREAM_VELOCITIES, stream};
+        let mut rng = stream(seed, STREAM_VELOCITIES);
+        let mut x = Vec::new();
+        for k in 0..n_edge.pow(3) {
+            let c = Vec3::new(
+                (k % n_edge) as f64,
+                ((k / n_edge) % n_edge) as f64,
+                (k / (n_edge * n_edge)) as f64,
+            ) * a
+                + Vec3::splat(0.5 * a);
+            let u = unit(&mut rng);
+            x.push(c + u * (0.5 * d));
+            x.push(c - u * (0.5 * d));
+        }
+        let edge = n_edge as f64 * a;
+        let cell = Cell::new(
+            [[edge, 0.0, 0.0], [0.0, edge, 0.0], [0.0, 0.0, edge]],
+            [true; 3],
+        )
+        .unwrap();
+        (x, cell)
+    }
+
+    /// Mean (atomic pressure, barostat pressure, Σ Δt²F²/(4m)/(3V)) in bar over an NVE run of free
+    /// stiff dimers, and the largest deviation of the barostat pressure from Σ M V²/(3V) (relative).
+    fn free_dimer_pressures(dt: f64, steps: u64) -> (f64, f64, f64, f64) {
+        use crate::random::{STREAM_VELOCITIES, stream};
+        use crate::velocities::maxwell_boltzmann;
+        let (k, d) = (2.0e5, 0.15);
+        let (x, cell) = dimer_lattice(4, 0.6, d, 41);
+        let n = x.len() / 2;
+        let system = flexible_dimers(n, [true; 3]);
+        let masses = system.masses().to_vec();
+        let v0 = maxwell_boltzmann(
+            &masses,
+            300.0,
+            6.0 * n as f64 - 3.0,
+            true,
+            &mut stream(42, STREAM_VELOCITIES),
+        );
+        let config = DynamicsConfig {
+            com_removed: true,
+            virial_every_step: true,
+            ..DynamicsConfig::nve(dt)
+        };
+        let state = State::new(x, Some(v0), Some(cell));
+        let provider = FreeDimers { k, r0: d };
+        let mut md = Dynamics::new(&system, provider, state, config, None).unwrap();
+        let (mut atomic, mut scaled, mut predicted, mut worst) = (0.0, 0.0, 0.0, 0.0f64);
+        md.run(steps, |m| {
+            let volume = m.state().cell.as_ref().unwrap().volume();
+            let trace3 = |p: ucmd_core::Mat3| (p.x_axis.x + p.y_axis.y + p.z_axis.z) / 3.0;
+            let p = trace3(m.scaling_pressure(m.forces.virial.unwrap(), volume).1);
+            let bar = ucmd_core::units::BAR_PER_KJMOL_NM3 / (3.0 * volume);
+            let mut two_k = 0.0;
+            for (v, mass) in m
+                .state()
+                .velocities
+                .chunks_exact(2)
+                .zip(masses.chunks_exact(2))
+            {
+                let total = mass[0] + mass[1];
+                two_k += total * ((v[0] * mass[0] + v[1] * mass[1]) / total).length_squared();
+            }
+            worst = worst.max((p / (two_k * bar) - 1.0).abs());
+            // the snapshot (thermo table) shows the pressure that drives the barostat
+            let shown = trace3(m.snapshot().molecular_pressure_bar.unwrap());
+            worst = worst.max((shown / (two_k * bar) - 1.0).abs());
+            atomic += trace3(m.snapshot().pressure_bar.unwrap());
+            scaled += p;
+            for (f, mass) in m.forces.forces.iter().zip(&masses) {
+                predicted += dt * dt * f.length_squared() / (4.0 * mass) * bar;
+            }
+        })
+        .unwrap();
+        let s = steps as f64;
+        (atomic / s, scaled / s, predicted / s, worst)
+    }
+
+    /// SC-3 (option B): the pressure that drives the barostat is the molecular one for flexible
+    /// molecules too. Free dimers have no molecular virial, so it is Σ M V²/(3V) to rounding at
+    /// every step, at any time step. The atomic pressure of the same run is low by
+    /// Σ Δt²F²/(4m)/(3V), the on-step bias of velocity Verlet (exact for a harmonic bond).
+    #[test]
+    fn the_barostat_pressure_of_flexible_molecules_has_no_time_step_bias() {
+        for dt in [0.001, 0.002] {
+            let (atomic, scaled, predicted, worst) = free_dimer_pressures(dt, 20_000);
+            eprintln!(
+                "free dimers, dt {dt} ps: atomic {atomic:.2}, barostat {scaled:.2}, difference \
+                 {:.2}, predicted −{predicted:.2} bar, worst |P/P_com − 1| {worst:.1e}",
+                atomic - scaled
+            );
+            assert!(worst < 1e-9, "not the molecular pressure: {worst}");
+            assert!(
+                ((scaled - atomic) / predicted - 1.0).abs() < 0.05,
+                "bias {} against {predicted} bar",
+                scaled - atomic
+            );
+        }
+    }
+
+    /// SC-3 (option B): the virial that drives the barostat is −dE/dε of the move it makes: every
+    /// molecule, flexible or not, is shifted with its centre of mass.
+    #[test]
+    fn the_barostat_virial_is_conjugate_to_the_molecular_scaling() {
+        let (x, cell) = dimer_lattice(4, 0.6, 0.15, 51);
+        let n = x.len() / 2;
+        let system = flexible_dimers(n, [true; 3]);
+        let masses = system.masses().to_vec();
+        let mut provider = DimerLj {
+            sigma: 0.3,
+            epsilon: 1.0,
+            cutoff: 0.75,
+            bond: Some((2.0e5, 0.14)), // stretched bonds: a large atomic virial
+        };
+        let request = EvalRequest {
+            step: 0,
+            time_ps: 0.0,
+            need_energy: true,
+            need_virial: true,
+        };
+        let mut energy = |eps: f64| {
+            let mut y = x.clone();
+            for k in 0..n {
+                let shift = molecular_mean(&x, &masses, &[2 * k, 2 * k + 1]) * eps;
+                y[2 * k] += shift;
+                y[2 * k + 1] += shift;
+            }
+            let scaled = cell.scaled(1.0 + eps).unwrap();
+            let mut out = ForceResult {
+                forces: vec![Vec3::ZERO; y.len()],
+                ..ForceResult::default()
+            };
+            provider
+                .evaluate(&y, Some(&scaled), &request, &mut out)
+                .unwrap();
+            out.energy.unwrap()
+        };
+        // the LJ pairs are cut (shifted, kinks only in the force), so a small strain is enough
+        let h = 1e-6;
+        let expected = -(energy(h) - energy(-h)) / (2.0 * h);
+        let state = State::new(x.clone(), None, Some(cell.clone()));
+        let mut state = state;
+        state.velocities = vec![Vec3::ZERO; x.len()];
+        let provider = DimerLj {
+            sigma: 0.3,
+            epsilon: 1.0,
+            cutoff: 0.75,
+            bond: Some((2.0e5, 0.14)),
+        };
+        let config = DynamicsConfig {
+            virial_every_step: true,
+            ..DynamicsConfig::nve(0.001)
+        };
+        let md = Dynamics::new(&system, provider, state, config, None).unwrap();
+        let w = md
+            .scaling_pressure(md.forces.virial.unwrap(), cell.volume())
+            .0;
+        let trace = w.x_axis.x + w.y_axis.y + w.z_axis.z;
+        eprintln!("tr W = {trace:.6}, −dE/dε = {expected:.6} kJ/mol");
+        assert!(
+            (trace / expected - 1.0).abs() < 1e-5,
+            "{trace} against {expected}"
         );
     }
 }

@@ -763,6 +763,74 @@ fn the_pressure_tensor_columns_add_up_to_the_pressure() {
     assert!(text.contains("E_INCOMPATIBLE"), "{text}");
 }
 
+/// Spec 0.1.3: `[output.thermo] pressure_molecular` adds one last column, which equals the pressure
+/// column of a system without bonds and comes after the tensor; a
+/// non-periodic system is refused (E_INCOMPATIBLE).
+#[test]
+fn the_molecular_pressure_column_is_written() {
+    let Some(spec) = spec() else { return };
+    let base = std::fs::read_to_string(spec.join("fixtures/runs/argon-pressure-tensor.toml"))
+        .unwrap()
+        .replace(
+            "system = \"../valid/argon-864\"",
+            "system = \"system.ucsys\"",
+        )
+        .replace("spec_version = \"0.1.1\"", "spec_version = \"0.1.3\"")
+        .replace("steps = 25000", "steps = 200")
+        .replace(
+            "pressure_tensor = true",
+            "pressure_tensor = true\npressure_molecular = true",
+        );
+    let dir = run_dir("pressure_molecular", &spec, "argon-864", &base);
+    let out = ucmd()
+        .arg("run")
+        .arg(dir.join("run.toml"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let table = std::fs::read_to_string(dir.join("out/thermo.tsv")).unwrap();
+    let mut lines = table.lines();
+    let names: Vec<&str> = lines
+        .next()
+        .unwrap()
+        .trim_start_matches("# ")
+        .split('\t')
+        .collect();
+    assert_eq!(names.last(), Some(&"pressure_molecular_bar"));
+    let atomic = names.iter().position(|c| *c == "pressure_bar").unwrap();
+    let mut rows = 0;
+    for line in lines {
+        let v: Vec<f64> = line.split('\t').map(|x| x.parse().unwrap()).collect();
+        assert_eq!(v.len(), names.len());
+        let (p, m) = (v[atomic], v[names.len() - 1]);
+        assert!((p - m).abs() <= 1e-8 * p.abs().max(1.0), "{p} vs {m}");
+        rows += 1;
+    }
+    assert_eq!(rows, 21);
+
+    let flat = std::fs::read_to_string(spec.join("fixtures/runs/harmonic-nve.toml"))
+        .unwrap()
+        .replace(
+            "system = \"../valid/harmonic-3d\"",
+            "system = \"system.ucsys\"",
+        )
+        .replace("spec_version = \"0.1.0\"", "spec_version = \"0.1.3\"")
+        + "\n[output]\ndirectory = \"out\"\n\n[output.thermo]\nfile = \"t.tsv\"\nevery = 1\npressure_molecular = true\n";
+    let dir = run_dir("pressure_molecular_flat", &spec, "harmonic-3d", &flat);
+    let out = ucmd()
+        .arg("check")
+        .arg(dir.join("run.toml"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout) + String::from_utf8_lossy(&out.stderr);
+    assert!(text.contains("E_INCOMPATIBLE"), "{text}");
+}
+
 /// E2.5: a package with model constraints runs (RATTLE) and keeps them, and minimizes on the
 /// constraint manifold.
 #[test]

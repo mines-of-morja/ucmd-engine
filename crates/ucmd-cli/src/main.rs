@@ -389,16 +389,15 @@ fn observers(
     let e = |e: ucmd_force::ObserverError| anyhow!("{e}");
     if let Some(thermo) = &output.thermo {
         let path = dir.join(&thermo.file);
+        let columns = ucmd_io::thermo::OptionalColumns {
+            pressure_tensor: thermo.pressure_tensor,
+            pressure_molecular: thermo.pressure_molecular,
+        };
         list.push(Box::new(match restart_step {
-            Some(step) => ucmd_io::ThermoWriter::open_append(
-                &path,
-                thermo.every,
-                step,
-                thermo.pressure_tensor,
-            )
-            .map_err(e)?,
-            None => ucmd_io::ThermoWriter::create(&path, thermo.every, thermo.pressure_tensor)
-                .map_err(e)?,
+            Some(step) => {
+                ucmd_io::ThermoWriter::open_append(&path, thermo.every, step, columns).map_err(e)?
+            }
+            None => ucmd_io::ThermoWriter::create(&path, thermo.every, columns).map_err(e)?,
         }));
     }
     if let Some(trajectory) = &output.trajectory {
