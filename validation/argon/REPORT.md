@@ -8,15 +8,17 @@
   production (25 000 × 4 fs) from the identical state in ucmd and in OpenMM 8.6.1 (Reference platform, `VerletIntegrator`).
 - Statistics: block averages (10 blocks); g(r) from every second stored frame; D from the COM-corrected MSD, fit 5–40 ps.
 
+Re-run on 2026-11-27 for the merge of all engine branches into `main`: every criterion passes. The numbers of the first run (2026-11-12, E1) are in the git history of this file; the equilibrated state differs between the two runs.
+
 | Quantity | ucmd | OpenMM | Pass | Criterion |
 |---|---|---|---|---|
-| <U> (kJ/mol) | -4290.53 ± 0.55 | -4290.30 ± 0.94 | ✅ | within 3 combined standard errors |
-| <T> (K) | 92.93 ± 0.05 | 92.91 ± 0.09 | ✅ | within 3 combined standard errors |
-| <P> (bar, no tail) | 306.3 ± 1.7 | 307.9 ± 3.1 | ✅ | within 3 combined standard errors |
-| g(r) first peak (nm) | 0.3675 (g = 2.891) | 0.3725 (g = 2.864) | ✅ | same bin ±1, height within 3 % |
-| max |Δg(r)| | 0.051 |  | ✅ | < 0.1 (statistical noise) |
-| D (10⁻⁵ cm²/s) | 2.410 | 2.308 | ✅ | within 15 % (one 100 ps run each) |
-| D vs Rahman 1964 (2.43) | 2.410 | 2.43 | ✅ | within 20 % (different cutoff, finite size) |
-| energy drift (kT/ns/DOF) | -7.76e-05 | 1.13e-04 | ✅ | |ucmd| ≤ 1.5 × max(|OpenMM|, 1e-4) |
+| <U> (kJ/mol) | -4279.26 ± 0.62 | -4279.97 ± 0.83 | ✅ | within 3 combined standard errors |
+| <T> (K) | 94.33 ± 0.06 | 94.46 ± 0.08 | ✅ | within 3 combined standard errors |
+| <P> (bar, no tail) | 335.0 ± 2.4 | 338.1 ± 2.6 | ✅ | within 3 combined standard errors |
+| g(r) first peak (nm) | 0.3675 (g = 2.856) | 0.3725 (g = 2.826) | ✅ | same bin ±1, height within 3 % |
+| max |Δg(r)| | 0.053 |  | ✅ | < 0.1 (statistical noise) |
+| D (10⁻⁵ cm²/s) | 2.342 | 2.566 | ✅ | within 15 % (one 100 ps run each) |
+| D vs Rahman 1964 (2.43) | 2.342 | 2.43 | ✅ | within 20 % (different cutoff, finite size) |
+| energy drift (kT/ns/DOF) | -9.77e-05 | -1.43e-04 | ✅ | |ucmd| ≤ 1.5 × max(|OpenMM|, 1e-4) |
 
-Wall time of the 100 ps production (one core): ucmd 46 s, OpenMM Reference 259 s.
+Wall time of the 100 ps production (one core): ucmd 54 s, OpenMM Reference 334 s.
