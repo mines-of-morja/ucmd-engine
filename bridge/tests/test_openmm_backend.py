@@ -603,9 +603,40 @@ def test_pair_overrides_agree_with_the_engine(tmp_path: Path) -> None:
 
 
 def test_pair_overrides_with_the_tail_correction_agree_with_the_engine(tmp_path: Path) -> None:
-    """Both at once (merge of the tail weights and the pair overrides, 2026-11-27): the classes
-    of the tail weights are the atom types, and the conformance single point with the tail
-    correction agrees with the CPU engine as without it."""
+    """Both at once (merge of the tail weights and the pair overrides, 2026-11-27).
+
+    The classes of the tail weights are the atom types. Kob-Andersen-500: OpenMM's tail is
+    -248.4928 kJ/mol against the exact 2π/V Σ n_a n_b ∫ r² u_ab of -248.4929 (relative -4.0e-7:
+    OpenMM integrates a custom tail numerically, see the water test above). The tail is 6.4 % of
+    the energy, so the single point agrees to 2.7e-8 here; wrong class weights would be O(1/N),
+    about 1e-4. Hence: the tail within 1e-6 of itself, the single point within 1e-7."""
+    import openmm as mm
+
+    from ucmd_bridge import model, package
+
+    fixture = SPEC / "fixtures/valid/kob-andersen-500"
+    top = package.load(fixture)
+    rc = 0.85
+    volume = abs(float(np.linalg.det(np.asarray(top.cell_nm))))
+    n = np.bincount(top.pairs.type_index)
+    exact = 0.0
+    for a in range(len(n)):
+        for b in range(len(n)):
+            s, e = top.pairs.sigma_nm[a, b], top.pairs.epsilon_kjmol[a, b]
+            integral = 4 * e * s**3 * ((s / rc) ** 9 / 9 - (s / rc) ** 3 / 3)
+            exact += 2 * np.pi / volume * n[a] * n[b] * integral
+
+    def energy(tail: bool) -> float:
+        settings = model.NonbondedSettings(cutoff_nm=rc, dispersion_correction=tail)
+        system, _ = model.build_system(top, settings)
+        platform = mm.Platform.getPlatformByName("Reference")
+        context = mm.Context(system, mm.VerletIntegrator(0.001), platform)
+        context.setPositions(np.load(fixture / "positions.npy"))
+        state = context.getState(getEnergy=True)
+        return state.getPotentialEnergy().value_in_unit(mm.unit.kilojoule_per_mole)
+
+    assert abs((energy(True) - energy(False)) / exact - 1) < 1e-6
+
     text = ARGON.format(steps=20, thermostat="nose-hoover-chain").replace(
         "timestep_fs = 4.0", "timestep_fs = 2.0"
     )
@@ -614,7 +645,7 @@ def test_pair_overrides_with_the_tail_correction_agree_with_the_engine(tmp_path:
     r = ucmd(tmp_path, profile)
     assert r.returncode == 0, r.stderr
     line = next(x for x in r.stderr.splitlines() if "conformance with" in x)
-    assert float(line.split("energy ")[1].split(",")[0]) < 1e-9, line
+    assert float(line.split("energy ")[1].split(",")[0]) < 1e-7, line
     assert float(line.split("forces ")[1].split(" ")[0]) < 1e-9, line
 
 
