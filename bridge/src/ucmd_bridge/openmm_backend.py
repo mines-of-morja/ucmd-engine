@@ -20,6 +20,11 @@
   second context that never steps (pressure.py): asked of the stepping GPU context the value
   drifted upward at fixed volume (study 2026-11-23_water-pressure-vs-density). Its mean equals
   the atomic virial pressure in equilibrium; its fluctuations are smaller.
+- **Pressure tensor (spec 0.1.1, V-1):** with `[output.thermo] pressure_tensor` every thermo row
+  holds the atomic tensor of the engine's definition, from central differences of the energy
+  under six affine strains in a third context that never steps (pressure.py, TensorProbe), and
+  `pressure_bar` is its trace / 3 there, as the spec requires. The molecular pressure then goes
+  only to `pressure_molecular_bar`. Systems with constraints are refused (E_UNSUPPORTED).
 - **Outputs** in the spec formats (thermo table, H5MD or extended XYZ), restartable from this
   backend's own checkpoint file (OpenMM's checkpoint behind a JSON header). SIGINT/SIGTERM stop
   gracefully with a checkpoint and exit status 128 + signal.
@@ -45,14 +50,21 @@ import numpy as np
 from . import __version__
 from .identity import DEFAULT_MAX_MOVE_NM, Tracker
 from .integrators import bath_energy, langevin_baoab, nose_hoover_chain, velocity_verlet
-from .model import ModelError, NonbondedSettings, build_system
+from .model import ModelError, NonbondedSettings, build_system, tail_virial_v
 from .package import ATOMIC_NUMBER, Topology
 from .package import load as load_package
-from .pressure import PressureProbe
+from .pressure import TENSOR_STRAIN, PressureProbe, TensorDiagnostics, TensorProbe
 
 BOLTZMANN_KJMOL_K = 1.380649e-23 * 6.02214076e23 / 1000.0  # CODATA 2018, exact
 BAR_PER_KJMOL_NM3 = 1e25 / 6.02214076e23
 MAGIC = b"UCMDOMM1\n"
+# spec 0.1.1 thermo columns of the symmetrized tensor and their element
+TENSOR_COLUMNS = {
+    "pressure_xx_bar": (0, 0), "pressure_yy_bar": (1, 1), "pressure_zz_bar": (2, 2),
+    "pressure_xy_bar": (0, 1), "pressure_xz_bar": (0, 2), "pressure_yz_bar": (1, 2),
+}  # fmt: skip
+# V-1 validation only: a file for the molecular tensor and Σ F⊗F/m at every tensor row
+DIAGNOSTICS_ENV = "UCMD_BRIDGE_TENSOR_DIAGNOSTICS"
 # ADR 0012 (precision tiers): the model-identity check of a mixed-precision run allows larger
 # pointwise force differences (single-precision forces: 5.5e-5 measured for the electrolyte);
 # mixed precision itself is admitted by a statistical comparison with double precision.
@@ -161,12 +173,6 @@ def read_plan(run_toml: Path) -> Plan:
     if raw.get("momentum", {}).get("remove_angular"):
         raise ConfigError("remove_angular is not implemented in the OpenMM backend")
     output = raw.get("output", {})
-    if output.get("thermo", {}).get("pressure_tensor"):
-        # spec 0.1.1: a backend that cannot compute the tensor refuses the run
-        raise ConfigError(
-            "E_UNSUPPORTED  [output.thermo] pressure_tensor: OpenMM gives no pressure tensor; "
-            "run on the CPU backend"
-        )
     trajectory = output.get("trajectory") or {}
     if str(trajectory.get("file", "")).endswith(".xyz"):
         for key in ("velocities", "forces"):
@@ -303,6 +309,15 @@ def run(args: argparse.Namespace) -> int:
             "E_UNSUPPORTED  [output.thermo] pressure_molecular: needs a periodic system and "
             "--pressure-every > 0"
         )
+    want_tensor = bool((plan.thermo or {}).get("pressure_tensor"))
+    if want_tensor and not periodic:
+        raise ConfigError("E_UNSUPPORTED  [output.thermo] pressure_tensor needs a periodic system")
+    if want_tensor and top.constraints:
+        # spec 0.1.1: a backend that cannot compute the tensor refuses the run
+        raise ConfigError(
+            "E_UNSUPPORTED  [output.thermo] pressure_tensor: the OpenMM backend computes the "
+            "tensor from energies and has no constraint virial; run on the CPU backend"
+        )
     temperature = plan.temperature_K
     if plan.remove_com_every > 0:
         system.addForce(mm.CMMotionRemover(plan.remove_com_every))
@@ -350,6 +365,17 @@ def run(args: argparse.Namespace) -> int:
             properties["DeviceIndex"] = args.device
     context = mm.Context(system, integrator, platform, properties)
     probe = PressureProbe(system, barostat, platform, properties) if barostat is not None else None
+    tensor_probe = None
+    diagnostics = None
+    if want_tensor:
+        probe_system, _ = build_system(top, settings, for_virial=True)
+        tensor_probe = TensorProbe(
+            probe_system, platform, properties, tail_virial_v(top, settings), TENSOR_STRAIN
+        )
+        if os.environ.get(DIAGNOSTICS_ENV):  # validation only (V-1), not a spec output
+            diagnostics = TensorDiagnostics(
+                Path(os.environ[DIAGNOSTICS_ENV]), top, args.restart is not None
+            )
     device = ""
     for name in ("DeviceName", "OpenCLPlatformName"):
         with contextlib.suppress(Exception):
@@ -414,6 +440,17 @@ def run(args: argparse.Namespace) -> int:
             "barostat": "MonteCarloBarostat" if plan.barostat else "none",
             "pressure": "molecular, MonteCarloBarostat.computeCurrentPressure in a second context "
             "that never steps (pressure.py)",
+            **(
+                {
+                    "pressure_tensor": "atomic, central differences of the energy under six "
+                    f"affine strains (relative strain {TENSOR_STRAIN:g}) in a context that never "
+                    "steps; LJ energy shifted inside the cutoff (no cutoff jumps) and the "
+                    "engine's virial-route tail added (pressure.py TensorProbe); pressure_bar "
+                    "is its trace / 3 on every thermo row"
+                }
+                if want_tensor
+                else {}
+            ),
             "constraints": f"{len(top.constraints)}, RATTLE in the CustomIntegrator, relative "
             f"tolerance {constraint_tolerance:g}"
             if constrained
@@ -439,7 +476,7 @@ def run(args: argparse.Namespace) -> int:
     if plan.thermo:
         thermo = ThermoWriter(
             plan.out_dir / plan.thermo["file"], restart_step,
-            bool(plan.thermo.get("pressure_molecular")),
+            bool(plan.thermo.get("pressure_molecular")), want_tensor,
         )  # fmt: skip
     if plan.trajectory:
         tpath = plan.out_dir / plan.trajectory["file"]
@@ -484,10 +521,14 @@ def run(args: argparse.Namespace) -> int:
     def observe(s: int, last_good: list) -> None:
         need_traj = bool(every["trajectory"]) and s % every["trajectory"] == 0
         need_p = probe is not None and bool(pressure_every) and s % pressure_every == 0
-        need_pos = need_traj or need_p or s % track_every_steps(plan.dt_ps, s * plan.dt_ps) == 0
+        need_t = tensor_probe is not None and bool(every["thermo"]) and s % every["thermo"] == 0
+        need_pos = (
+            need_traj or need_p or need_t
+            or s % track_every_steps(plan.dt_ps, s * plan.dt_ps) == 0
+        )  # fmt: skip
         state = context.getState(
             getEnergy=True, getPositions=need_pos,
-            getVelocities=need_p or (need_traj and "velocity" in vectors),
+            getVelocities=need_p or need_t or (need_traj and "velocity" in vectors),
             getForces=need_traj and "force" in vectors, enforcePeriodicBox=False,
         )  # fmt: skip
         k = state.getKineticEnergy().value_in_unit(unit.kilojoule_per_mole)
@@ -517,9 +558,22 @@ def run(args: argparse.Namespace) -> int:
             "temperature_K": 2.0 * k / (dof * BOLTZMANN_KJMOL_K), "pressure_bar": pressure,
             "volume_nm3": volume,
             # spec 0.1.3, written only when asked for: OpenMM's pressure is the molecular one, so
-            # on this backend both columns show the same value
+            # on this backend both columns show the same value (without the tensor)
             "pressure_molecular_bar": pressure,
         }  # fmt: skip
+        if need_t:  # spec 0.1.1: the atomic tensor, and pressure_bar its trace / 3
+            x_nm = np.asarray(state.getPositions(asNumpy=True).value_in_unit(unit.nanometer))
+            v_nm_ps = np.asarray(
+                state.getVelocities(asNumpy=True).value_in_unit(unit.nanometer / unit.picosecond)
+            )
+            if diagnostics is not None:
+                tensor, extra = tensor_probe.with_diagnostics(x_nm, v_nm_ps, cell, diagnostics.groups)
+                diagnostics.write(s, t_ps, extra)
+            else:
+                tensor = tensor_probe.tensor(x_nm, v_nm_ps, cell)
+            for name, (a, b) in TENSOR_COLUMNS.items():
+                row[name] = float(tensor[a, b])
+            row["pressure_bar"] = float(np.trace(tensor) / 3.0)
         if not all(math.isfinite(x) for x in (k, u)):
             raise ModelError(f"non-finite energy at step {s}")
         if thermo and every["thermo"] and s % every["thermo"] == 0:
@@ -573,7 +627,7 @@ def run(args: argparse.Namespace) -> int:
         status = 1
     if status == 0 and ckpt_path is not None:
         write_checkpoint(ckpt_path, meta(), context.createCheckpoint())
-    for w in (thermo, traj):
+    for w in (thermo, traj, diagnostics):
         if w is not None:
             w.close()
     elapsed = time.perf_counter() - started

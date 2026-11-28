@@ -19,6 +19,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from ucmd_bridge.openmm_backend import BOLTZMANN_KJMOL_K
+
 ENGINE = Path(__file__).resolve().parents[2]
 SPEC = Path(os.environ.get("UCMD_SPEC_DIR", ENGINE.parent / "spec"))
 UCMD = next(
@@ -222,15 +224,101 @@ def test_csvr_and_a_wrong_model_are_refused(tmp_path: Path) -> None:
     assert r.returncode == 2 and "conformance check failed" in r.stderr
 
 
-def test_the_pressure_tensor_is_refused(tmp_path: Path) -> None:
-    """Spec 0.1.1: OpenMM gives no pressure tensor, so [output.thermo] pressure_tensor must stop
-    the run before it starts, not produce a table without it."""
-    text = ARGON.format(steps=20, thermostat="nose-hoover-chain").replace(
-        '[output.thermo]\nfile = "thermo.tsv"\nevery = 10\n',
-        '[output.thermo]\nfile = "thermo.tsv"\nevery = 10\npressure_tensor = true\n',
+WATER_BOX = """\
+spec_version = "0.1.3"
+system = "system.ucsys"
+title = "bridge test: flexible water, pressure tensor"
+
+[run]
+integrator = "velocity-verlet"
+timestep_fs = 0.5
+steps = 20
+seed = 3
+
+[[providers]]
+kind = "force-field"
+cutoff_nm = 0.7
+coulomb = "pme"
+ewald_tolerance = 1e-6
+dispersion_correction = true
+
+[output]
+directory = "{out}"
+
+[output.thermo]
+file = "thermo.tsv"
+every = 2
+pressure_tensor = true
+pressure_molecular = {molecular}
+"""
+TENSOR = ["pressure_xx_bar", "pressure_yy_bar", "pressure_zz_bar", "pressure_xy_bar",
+          "pressure_xz_bar", "pressure_yz_bar"]  # fmt: skip
+
+
+def _water_box(tmp: Path, n_side: int = 6, spacing: float = 0.31, seed: int = 8) -> None:
+    """n_side³ flexible SPC/Fw molecules (the water-2 fixture's force field) on a lattice with
+    random orientations, a little off the equilibrium geometry, and 300 K velocities."""
+    rng = np.random.default_rng(seed)
+    pkg = tmp / "system.ucsys"
+    doc = json.loads((pkg / "system.json").read_text())
+    n = n_side**3
+    box = n_side * spacing
+    doc.update(periodicity=[True, True, True], cell_nm=(np.eye(3) * box).tolist(),
+               components=[{"molecule_type": "SPCFw", "count": n}], atom_count=3 * n)  # fmt: skip
+    (pkg / "system.json").write_text(json.dumps(doc))
+    r_oh, half = 0.1012, np.radians(113.24) / 2
+    local = np.array([[0, 0, 0], [r_oh * np.sin(half), r_oh * np.cos(half), 0],
+                      [-r_oh * np.sin(half), r_oh * np.cos(half), 0]])  # fmt: skip
+    grid = np.stack(np.meshgrid(*[np.arange(n_side)] * 3, indexing="ij"), -1).reshape(-1, 3)
+    x = []
+    for site in grid:
+        q, _ = np.linalg.qr(rng.normal(size=(3, 3)))
+        x += list((site + 0.5) * spacing + local @ q.T + rng.normal(scale=0.003, size=(3, 3)))
+    np.save(pkg / "positions.npy", np.array(x))
+    masses = np.tile([15.9994, 1.008, 1.008], n)
+    kt = BOLTZMANN_KJMOL_K * 300.0
+    np.save(pkg / "velocities.npy", rng.normal(size=(3 * n, 3)) * np.sqrt(kt / masses)[:, None])
+
+
+def test_the_pressure_tensor_equals_the_engines(tmp_path: Path) -> None:
+    """V-1 acceptance (design §6): flexible water with PME and the LJ tail, the same start and
+    the same velocity Verlet on both backends: every tensor column within 1 bar of the CPU
+    engine's at every row, pressure_bar its trace / 3, the molecular pressure in its own
+    column."""
+    profile = setup_run(tmp_path, "water-2", WATER_BOX.format(out="out", molecular="true"))
+    _water_box(tmp_path)
+    r = ucmd(tmp_path, profile)
+    assert r.returncode == 0, r.stderr
+    (tmp_path / "run.toml").write_text(WATER_BOX.format(out="cpu", molecular="false"))
+    cpu_profile = tmp_path / "cpu.toml"
+    cpu_profile.write_text("threads = 1\n")
+    c = ucmd(tmp_path, cpu_profile)
+    assert c.returncode == 0, c.stderr
+    names, gpu = thermo(tmp_path)
+    with (tmp_path / "cpu/thermo.tsv").open() as fh:
+        cpu_names = fh.readline().lstrip("# ").strip().split("\t")
+        cpu = np.loadtxt(fh, ndmin=2)
+    assert names[-7:] == [*TENSOR, "pressure_molecular_bar"]
+    got = gpu[:, [names.index(k) for k in TENSOR]]
+    want = cpu[:, [cpu_names.index(k) for k in TENSOR]]
+    print("bridge − engine, bar, per column:", np.abs(got - want).max(0).round(4).tolist())
+    print("largest |P_ab| of the engine:", np.abs(want).max().round(1))
+    assert np.abs(want[:, 3:]).max() > 100.0  # shear components with something in them
+    np.testing.assert_allclose(got, want, rtol=0, atol=1.0)  # bar
+    np.testing.assert_allclose(
+        gpu[:, names.index("pressure_bar")], got[:, :3].mean(1), rtol=1e-9, atol=1e-6
     )
-    assert "pressure_tensor = true" in text
-    profile = setup_run(tmp_path, "argon-864", text.replace('"0.1.0"', '"0.1.1"', 1))
+    assert np.isfinite(gpu[0, names.index("pressure_molecular_bar")])
+
+
+def test_the_pressure_tensor_with_constraints_is_refused(tmp_path: Path) -> None:
+    """The tensor comes from energies; a constraint virial is not among them."""
+    profile = setup_run(tmp_path, "water-2", WATER_BOX.format(out="out", molecular="false"))
+    _water_box(tmp_path)
+    pkg = tmp_path / "system.ucsys"
+    doc = json.loads((pkg / "system.json").read_text())
+    doc["molecule_types"]["SPCFw"]["constraints"] = [{"atoms": [0, 1], "length_nm": 0.1012}]
+    (pkg / "system.json").write_text(json.dumps(doc))
     r = ucmd(tmp_path, profile)
     assert r.returncode != 0 and "E_UNSUPPORTED" in r.stderr, r.stderr
     assert not (tmp_path / "out/thermo.tsv").exists()

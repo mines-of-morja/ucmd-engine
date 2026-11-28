@@ -24,6 +24,14 @@ THERMO_COLUMNS = (
     "pressure_bar",
     "volume_nm3",
 )
+TENSOR_COLUMNS = (
+    "pressure_xx_bar",
+    "pressure_yy_bar",
+    "pressure_zz_bar",
+    "pressure_xy_bar",
+    "pressure_xz_bar",
+    "pressure_yz_bar",
+)
 ANGSTROM_PER_NM = 10.0
 
 
@@ -37,11 +45,17 @@ class ThermoWriter:
     """The thermo table of spec/run-config.md (tab-separated, one flushed line per row)."""
 
     def __init__(
-        self, path: Path, restart_step: int | None, pressure_molecular: bool = False
+        self,
+        path: Path,
+        restart_step: int | None,
+        pressure_molecular: bool = False,
+        pressure_tensor: bool = False,
     ) -> None:
         self.path = path
         self.columns = THERMO_COLUMNS
-        if pressure_molecular:  # spec 0.1.3; the last column
+        if pressure_tensor:  # spec 0.1.1; after the others
+            self.columns += TENSOR_COLUMNS
+        if pressure_molecular:  # spec 0.1.3; the last column, after the tensor
             self.columns += ("pressure_molecular_bar",)
         if restart_step is not None and path.is_file():
             kept = []

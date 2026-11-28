@@ -14,6 +14,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+import numpy as np
 import openmm as mm
 
 from .package import Topology
@@ -176,8 +177,48 @@ def _lj_force(top: Topology, shift: str, tail: bool) -> mm.CustomNonbondedForce:
     return lj
 
 
-def build_system(top: Topology, s: NonbondedSettings) -> tuple[mm.System, dict]:
-    """The OpenMM System and a description of the electrostatics, for provenance."""
+def tail_virial_v(top: Topology, s: NonbondedSettings) -> float:
+    """V·W_tail (kJ/mol·nm³) of the engine's LJ tail, virial route: each diagonal element of the
+    tail virial is this divided by the volume (ucmd-providers-classical, nonbonded.rs):
+    (16π/3) Σ_ab N_a N_b ε_ab σ_ab³ (2x⁹/3 − x³), x = σ_ab/r_c, over ordered type pairs.
+
+    Not the strain derivative of the tail energy E_tail = (8π/3V) Σ N_a N_b ε σ³ (x⁹/3 − x³):
+    the two differ by (8π/3V) Σ N_a N_b ε σ³ (x⁹ − x³), the impulsive term of the truncation
+    with g(r_c) = 1. Types with the same σ and ε are merged; the sum does not change."""
+    if not (s.dispersion_correction and s.cutoff_nm):
+        return 0.0
+    if top.pairs is not None:
+        index = np.asarray(top.pairs.type_index)
+        types = sorted(set(index.tolist()))
+        counts = np.array([np.count_nonzero(index == t) for t in types], dtype=float)
+        sig = top.pairs.sigma_nm[np.ix_(types, types)]
+        eps = top.pairs.epsilon_kjmol[np.ix_(types, types)]
+    else:
+        keys = list(zip(top.sigma_nm.tolist(), top.epsilon_kjmol.tolist(), strict=True))
+        uniq = sorted(set(keys))
+        counts = np.array([keys.count(k) for k in uniq], dtype=float)
+        si = np.array([k[0] for k in uniq])
+        ei = np.array([k[1] for k in uniq])
+        if top.combination_rule == "geometric":
+            sig = np.sqrt(np.outer(si, si))
+        else:
+            sig = 0.5 * (si[:, None] + si[None, :])
+        eps = np.sqrt(np.outer(ei, ei))
+    x3 = (sig / s.cutoff_nm) ** 3
+    w = np.outer(counts, counts) * eps * sig**3 * (2.0 * x3**3 / 3.0 - x3)
+    return float(16.0 * math.pi / 3.0 * w.sum())
+
+
+def build_system(
+    top: Topology, s: NonbondedSettings, for_virial: bool = False
+) -> tuple[mm.System, dict]:
+    """The OpenMM System and a description of the electrostatics, for provenance.
+
+    `for_virial` builds the system of the pressure-tensor probe (pressure.py): the same forces,
+    but a truncated LJ energy shifted by −u_ab(r_c) inside the cutoff, so that the energy is
+    continuous at r_c and its strain derivative is the virial of the forces (a truncated energy
+    jumps where a pair crosses r_c, and its finite differences pick up those jumps), and no tail
+    correction (the probe adds the engine's virial-route tail, `tail_virial_v`)."""
     periodic = top.cell_nm is not None
     if periodic and s.cutoff_nm is None:
         raise ModelError("a periodic package needs cutoff_nm")
@@ -225,10 +266,14 @@ def build_system(top: Topology, s: NonbondedSettings) -> tuple[mm.System, dict]:
     shift = " - 4*eps*((sig/rc)^12-(sig/rc)^6)" if s.lj_cutoff_mode == "potential-shift" else ""
     if s.dispersion_correction and not periodic:
         raise ModelError("the tail correction needs a periodic package")
-    lj = _lj_force(top, shift, s.dispersion_correction)
+    tail = s.dispersion_correction and not for_virial
+    if for_virial and periodic and s.lj_cutoff_mode == "truncate":
+        # potential shift: continuous at r_c, the same forces (a constant inside the cutoff)
+        shift = " - 4*eps*((sig/rc)^12-(sig/rc)^6)"
+    lj = _lj_force(top, shift, tail)
     for i, j in (*top.excluded, *top.pairs14):
         lj.addExclusion(i, j)
-    lj.setUseLongRangeCorrection(s.dispersion_correction)
+    lj.setUseLongRangeCorrection(tail)
     info: dict = {"coulomb": "direct"}
     if periodic:
         alpha, nx, ny, nz = pme_parameters(top.cell_nm, s)
