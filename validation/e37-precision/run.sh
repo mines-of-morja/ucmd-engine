@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 ROOT=../../..
 UCMD=$(realpath ../../target/release/ucmd)
 WRAPPER=$(realpath ../../bridge/docker/ucmd-openmm-docker.sh)
-PY=$(realpath ../../bridge/.venv/bin/python)
+PY="$PWD/../../bridge/.venv/bin/python"
 CLI=$(realpath $ROOT/ucmd-analysis/.venv/bin/ucmd-analyze)
 rm -rf out && mkdir -p out
 "$ROOT/ucmd-builder/.venv/bin/ucmd-build" build emc_pure.toml -o out/built.ucsys -q
